@@ -1,6 +1,7 @@
 services:
-  web-server:
-    image: nginx:latest
+  mqtt-broker:
+    build: .
     ports:
-      - "8081:80"
+      - "8443:8443"
+      - "3000:3000"
     restart: always
