@@ -27,11 +27,21 @@ async function startMqttServer() {
     const server = tls.createServer(options, aedes.handle);
     const PORT = 8443;
 
+    // Track connected MQTT clients
+    const connectedClients = new Map();
+
     server.listen(PORT, function () {
       console.log(`MQTT mTLS 伺服器已啟動，正在監聽連接埠 ${PORT}`);
     });
 
     aedes.on('client', function (client) {
+	const clientInfo = {
+		id: client.id,
+		connected_at: new Date().toISOString(),
+		tls: false,
+		cert: null
+	};
+
 	if (client.conn && typeof client.conn.getPeerCertificate === 'function') {
 
 		// 傳入 true 參數可以取得包含完整憑證鏈的詳細資訊 (可選)
@@ -41,12 +51,11 @@ async function startMqttServer() {
 		if (cert && Object.keys(cert).length > 0) {
 			console.log(`[mTLS 驗證成功] 客戶端 ID: ${client.id}`);
 
-
       // 1. 取得 Node.js 原始的連續大寫序號字串
-      const rawSerial = cert.serialNumber; 
-      
+      const rawSerial = cert.serialNumber;
+
       // 2. 轉換為小寫，並使用正規表達式每兩個字元插入一個冒號
-      let formattedSerial = '無法取得序號';
+      let formattedSerial = '';
       if (rawSerial) {
         formattedSerial = rawSerial
           .toLowerCase()
@@ -57,30 +66,41 @@ async function startMqttServer() {
       // 3. 輸出與 DUT 完全相同的格式
       console.log(`  - 憑證序號 (Serial): ${formattedSerial}`);
 
-
-
-
 			// 記錄憑證的關鍵欄位
 			console.log(`  - 設備/通用名稱 (CN):`, cert.subject.CN);
 			console.log(`  - 頒發機構 (Issuer CN):`, cert.issuer.CN);
 			console.log(`  - 憑證指紋 (Fingerprint):`, cert.fingerprint);
 			console.log(`  - 有效期限至:`, cert.valid_to);
 
-			// 如果您的設備憑證有使用 SAN (Subject Alternative Name)，也可以記錄下來
 			if (cert.subjectaltname) {
 				console.log(`  - 替代名稱 (SAN):`, cert.subjectaltname);
 			}
-			} else {
-				console.warn(`[警告] 客戶端 ${client.id} 未提供憑證。`);
-			}
+
+			clientInfo.tls = true;
+			clientInfo.cert = {
+				cn: cert.subject.CN,
+				issuer: cert.issuer.CN,
+				serial: formattedSerial,
+				fingerprint: cert.fingerprint,
+				valid_to: cert.valid_to,
+				san: cert.subjectaltname || ''
+			};
+		} else {
+			console.warn(`[警告] 客戶端 ${client.id} 未提供憑證。`);
+		}
 	}
 	else {
 		console.log(`客戶端已連線: ${client.id} (非 TLS 連線)`);
 	}
+
+	connectedClients.set(client.id, clientInfo);
     });
 
     aedes.on('clientDisconnect', function (client) {
       console.log(`客戶端已斷線: ${client ? client.id : client}`);
+      if (client) {
+        connectedClients.delete(client.id);
+      }
     });
 
     aedes.on('publish', function (packet, client) {
@@ -99,12 +119,21 @@ async function startMqttServer() {
 
     // Version endpoint — MUST be updated on every code change
     const VERSION_INFO = {
-      version: '1.0.0',
-      deployed: '2026-04-07T10:00:00Z',
-      commit: '4979da5'
+      version: '1.1.0',
+      deployed: '2026-04-07T11:30:00Z',
+      commit: 'pending'
     };
     app.get('/version', (req, res) => {
       res.json(VERSION_INFO);
+    });
+
+    // MQTT client connection status endpoint
+    app.get('/api/clients', (req, res) => {
+      const clients = Array.from(connectedClients.values());
+      res.json({
+        total: clients.length,
+        clients: clients
+      });
     });
 
     // 建立觸發輪替的 HTTP POST 路由
