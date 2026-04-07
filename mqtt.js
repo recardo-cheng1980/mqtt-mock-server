@@ -96,6 +96,17 @@ async function startMqttServer() {
     //The http part
     const app = express();
     app.use(express.json());
+
+    // Version endpoint — MUST be updated on every code change
+    const VERSION_INFO = {
+      version: '1.0.0',
+      deployed: '2026-04-07T10:00:00Z',
+      commit: 'initial'
+    };
+    app.get('/version', (req, res) => {
+      res.json(VERSION_INFO);
+    });
+
     // 建立觸發輪替的 HTTP POST 路由
     app.post('/api/rotate/:deviceId', (req, res) => {
       const deviceId = req.params.deviceId;
