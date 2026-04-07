@@ -101,7 +101,7 @@ async function startMqttServer() {
     const VERSION_INFO = {
       version: '1.0.0',
       deployed: '2026-04-07T10:00:00Z',
-      commit: 'initial'
+      commit: '4979da5'
     };
     app.get('/version', (req, res) => {
       res.json(VERSION_INFO);
