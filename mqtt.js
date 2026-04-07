@@ -117,14 +117,14 @@ async function startMqttServer() {
     const app = express();
     app.use(express.json());
 
-    // Version endpoint — MUST be updated on every code change
-    const VERSION_INFO = {
-      version: '1.1.0',
-      deployed: '2026-04-07T11:30:00Z',
-      commit: '01a2cc3'
-    };
+    // Version endpoint — update version in package.json on every code change
+    const pkg = JSON.parse(fs.readFileSync(path.join(__dirname, 'package.json'), 'utf8'));
+    const startedAt = new Date().toISOString();
     app.get('/version', (req, res) => {
-      res.json(VERSION_INFO);
+      res.json({
+        version: pkg.version,
+        started: startedAt
+      });
     });
 
     // MQTT client connection status endpoint
@@ -166,6 +166,38 @@ async function startMqttServer() {
         res.status(200).json({ 
           status: 'ok', 
           message: `已觸發 ${deviceId} 的憑證輪替`,
+          delivered_payload: requestPayload
+        });
+      });
+    });
+
+    // Docker pull endpoint — publishes to kms/<deviceId>/pull
+    app.post('/api/pull/:deviceId', (req, res) => {
+      const deviceId = req.params.deviceId;
+      const requestPayload = req.body;
+
+      if (!requestPayload || !requestPayload.image) {
+        return res.status(400).json({ error: 'Missing required field: image' });
+      }
+
+      const packet = {
+        cmd: 'publish',
+        qos: 1,
+        topic: `kms/${deviceId}/pull`,
+        payload: Buffer.from(JSON.stringify(requestPayload)),
+        retain: false
+      };
+
+      aedes.publish(packet, function (err) {
+        if (err) {
+          console.error(`[HTTP Bridge] Failed to publish pull command for ${deviceId}:`, err);
+          return res.status(500).json({ status: 'error', message: 'MQTT publish failed' });
+        }
+
+        console.log(`[HTTP Bridge] Pull command published to topic: ${packet.topic}`);
+        res.status(200).json({
+          status: 'ok',
+          message: `Pull command sent to ${deviceId}`,
           delivered_payload: requestPayload
         });
       });
