@@ -4,13 +4,13 @@ const fs = require('node:fs');
 // 1. Load your certificate and key files
 const options = {
   //Server side
-  key: fs.readFileSync('privkey.pem'),
-  cert: fs.readFileSync('fullchain.pem'),
+  key: fs.readFileSync('./certs/privkey.pem'),
+  cert: fs.readFileSync('./certs/fullchain.pem'),
 
   //Auth the client CA
   ca: [
-    fs.readFileSync('intermediate-ca.crt'),
-    fs.readFileSync('root-ca.crt')
+    fs.readFileSync('./certs/intermediate-ca.crt'),
+    fs.readFileSync('./certs/root-ca.crt')
   ],
   requestCert: true,
   rejectUnauthorized: true

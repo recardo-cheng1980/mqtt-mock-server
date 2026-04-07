@@ -4,4 +4,6 @@ services:
     ports:
       - "8443:8443"
       - "3000:3000"
+    volumes:
+      - ./certs:/app/certs:ro
     restart: always

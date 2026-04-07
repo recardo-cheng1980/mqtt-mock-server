@@ -13,11 +13,11 @@ async function startMqttServer() {
     const aedes = await Aedes.createBroker();
 
     const options = {
-  	key: fs.readFileSync('privkey.pem'),
-	cert: fs.readFileSync('fullchain.pem'),
+  	key: fs.readFileSync('./certs/privkey.pem'),
+	cert: fs.readFileSync('./certs/fullchain.pem'),
 	ca: [
-		fs.readFileSync('intermediate-ca.crt'),
-		fs.readFileSync('root-ca.crt')
+		fs.readFileSync('./certs/intermediate-ca.crt'),
+		fs.readFileSync('./certs/root-ca.crt')
  	],
       // mTLS 核心設定
       requestCert: true,
