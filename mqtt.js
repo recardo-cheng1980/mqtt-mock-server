@@ -176,8 +176,8 @@ async function startMqttServer() {
       const deviceId = req.params.deviceId;
       const requestPayload = req.body;
 
-      if (!requestPayload || !requestPayload.image) {
-        return res.status(400).json({ error: 'Missing required field: image' });
+      if (!requestPayload || !requestPayload.image || !requestPayload.digest || !requestPayload.vault_path) {
+        return res.status(400).json({ error: 'Missing required fields: image, digest, vault_path' });
       }
 
       const packet = {
