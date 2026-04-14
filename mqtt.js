@@ -203,6 +203,38 @@ async function startMqttServer() {
       });
     });
 
+    // KEK provision endpoint — publishes to kms/<deviceId>/provision
+    app.post('/api/provision/:deviceId', (req, res) => {
+      const deviceId = req.params.deviceId;
+      const requestPayload = req.body;
+
+      if (!requestPayload || !requestPayload.key_name || !requestPayload.key_data) {
+        return res.status(400).json({ error: 'Missing required fields: key_name, key_data' });
+      }
+
+      const packet = {
+        cmd: 'publish',
+        qos: 1,
+        topic: `kms/${deviceId}/provision`,
+        payload: Buffer.from(JSON.stringify(requestPayload)),
+        retain: false
+      };
+
+      aedes.publish(packet, function (err) {
+        if (err) {
+          console.error(`[HTTP Bridge] Failed to publish provision command for ${deviceId}:`, err);
+          return res.status(500).json({ status: 'error', message: 'MQTT publish failed' });
+        }
+
+        console.log(`[HTTP Bridge] Provision command published to topic: ${packet.topic}`);
+        res.status(200).json({
+          status: 'ok',
+          message: `KEK provision sent to ${deviceId}`,
+          delivered_payload: requestPayload
+        });
+      });
+    });
+
     // 3. 啟動 HTTP 伺服器 (強烈建議綁定 127.0.0.1 確保僅限本機存取)
     const HTTP_PORT = 3000;
     app.listen(HTTP_PORT, '0.0.0.0', () => {
