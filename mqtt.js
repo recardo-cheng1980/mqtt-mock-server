@@ -30,6 +30,9 @@ async function startMqttServer() {
     // Track connected MQTT clients
     const connectedClients = new Map();
 
+    // AVC denial report store — Map<deviceId, AvcReport[]>, keeps last 100 reports per device
+    const avcStore = new Map();
+
     server.listen(PORT, function () {
       console.log(`MQTT mTLS 伺服器已啟動，正在監聽連接埠 ${PORT}`);
     });
@@ -115,7 +118,7 @@ async function startMqttServer() {
 
     //The http part
     const app = express();
-    app.use(express.json());
+    app.use(express.json({ limit: '10mb' }));  // AVC reports can be large
 
     // Version endpoint — update version in package.json on every code change
     const pkg = JSON.parse(fs.readFileSync(path.join(__dirname, 'package.json'), 'utf8'));
@@ -234,6 +237,78 @@ async function startMqttServer() {
         });
       });
     });
+
+    // ── SELinux AVC Denial Reporting Endpoints ──────────────────────────────
+    // DUT posts JSON batches via HTTPS; no MQTT cert dependency required.
+
+    // POST /api/avc-report  — receive AVC denial batch from any device
+    app.post('/api/avc-report', (req, res) => {
+      const report = req.body;
+
+      if (!report || !report.device_id) {
+        return res.status(400).json({ error: 'Missing required field: device_id' });
+      }
+
+      report.received_at = new Date().toISOString();
+      const deviceId = report.device_id;
+
+      if (!avcStore.has(deviceId)) avcStore.set(deviceId, []);
+      const reports = avcStore.get(deviceId);
+      reports.push(report);
+      if (reports.length > 100) reports.shift();  // keep last 100 per device
+
+      console.log(`[AVC] Received ${report.denial_count || 0} denials from ${deviceId} ` +
+                  `(policy v${report.selinux_policy_version}, mode: ${report.selinux_mode})`);
+      res.json({ status: 'ok', received: report.denial_count || 0 });
+    });
+
+    // GET /api/avc-report/:deviceId  — query stored reports for a specific device
+    app.get('/api/avc-report/:deviceId', (req, res) => {
+      const deviceId = req.params.deviceId;
+      const reports = avcStore.get(deviceId) || [];
+      res.json({
+        device_id: deviceId,
+        report_count: reports.length,
+        reports
+      });
+    });
+
+    // GET /api/avc-report  — summary of all devices with AVC data
+    app.get('/api/avc-report', (req, res) => {
+      const summary = [];
+      for (const [deviceId, reports] of avcStore.entries()) {
+        const latest = reports[reports.length - 1];
+        summary.push({
+          device_id: deviceId,
+          report_count: reports.length,
+          latest_upload: latest?.upload_timestamp,
+          latest_received: latest?.received_at,
+          latest_denial_count: latest?.denial_count,
+          selinux_mode: latest?.selinux_mode,
+          policy_version: latest?.selinux_policy_version,
+          firmware_version: latest?.firmware_version
+        });
+      }
+      res.json({ total_devices: summary.length, devices: summary });
+    });
+
+    // POST /api/avc-request/:deviceId  — request immediate upload from a device (via MQTT)
+    app.post('/api/avc-request/:deviceId', (req, res) => {
+      const deviceId = req.params.deviceId;
+      const packet = {
+        cmd: 'publish',
+        qos: 1,
+        topic: `kms/${deviceId}/avc-request`,
+        payload: Buffer.from(JSON.stringify({ action: 'upload_now' })),
+        retain: false
+      };
+      aedes.publish(packet, (err) => {
+        if (err) return res.status(500).json({ status: 'error', message: err.message });
+        console.log(`[AVC] Upload request sent to ${deviceId}`);
+        res.json({ status: 'ok', message: `Upload request sent to ${deviceId}` });
+      });
+    });
+    // ────────────────────────────────────────────────────────────────────────
 
     // 3. 啟動 HTTP 伺服器 (強烈建議綁定 127.0.0.1 確保僅限本機存取)
     const HTTP_PORT = 3000;
