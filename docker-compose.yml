@@ -6,4 +6,5 @@ services:
       - "3000:3000"
     volumes:
       - /etc/app/certs:/app/certs:ro
+      - /home/ext_recardo_cheng_gmail_com/avc-report:/app/avc-reports
     restart: always
