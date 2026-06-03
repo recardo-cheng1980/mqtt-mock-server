@@ -273,9 +273,10 @@ async function startMqttServer() {
         console.error('[AVC] Failed to persist report to disk:', e.message);
       }
 
-      console.log(`[AVC] Received ${report.denial_count || 0} denials from ${deviceId} ` +
-                  `(policy v${report.selinux_policy_version}, wnc_local v${report.wnc_local_version || '?'}, mode: ${report.selinux_mode})`);
-      res.json({ status: 'ok', received: report.denial_count || 0 });
+      console.log(`[AVC] Received from ${deviceId}: ${report.denial_count || 0} unique types` +
+                  ` (${report.raw_denial_count || '?'} raw records)` +
+                  ` | policy v${report.selinux_policy_version}, wnc_local v${report.wnc_local_version || '?'}, mode: ${report.selinux_mode}`);
+      res.json({ status: 'ok', unique_types: report.denial_count || 0, raw_records: report.raw_denial_count || 0 });
     });
 
     // GET /api/avc-report/:deviceId  — query stored reports for a specific device
