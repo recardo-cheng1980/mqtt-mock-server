@@ -33,6 +33,10 @@ async function startMqttServer() {
     // AVC denial report store — Map<deviceId, AvcReport[]>, keeps last 100 reports per device
     const avcStore = new Map();
 
+    // Persistent storage directory for AVC reports (survives server restarts)
+    const AVC_DIR = path.join(__dirname, 'avc-reports');
+    if (!fs.existsSync(AVC_DIR)) fs.mkdirSync(AVC_DIR, { recursive: true });
+
     server.listen(PORT, function () {
       console.log(`MQTT mTLS 伺服器已啟動，正在監聽連接埠 ${PORT}`);
     });
@@ -257,8 +261,20 @@ async function startMqttServer() {
       reports.push(report);
       if (reports.length > 100) reports.shift();  // keep last 100 per device
 
+      // Persist to disk: ./avc-reports/<deviceId>/<safe_timestamp>.json
+      try {
+        const safeTs = (report.upload_timestamp || report.received_at).replace(/[:.]/g, '-');
+        const deviceDir = path.join(AVC_DIR, deviceId);
+        if (!fs.existsSync(deviceDir)) fs.mkdirSync(deviceDir, { recursive: true });
+        const filePath = path.join(deviceDir, `${safeTs}.json`);
+        fs.writeFileSync(filePath, JSON.stringify(report, null, 2));
+        console.log(`[AVC] Saved ${report.denial_count || 0} denials from ${deviceId} → ${path.basename(filePath)}`);
+      } catch (e) {
+        console.error('[AVC] Failed to persist report to disk:', e.message);
+      }
+
       console.log(`[AVC] Received ${report.denial_count || 0} denials from ${deviceId} ` +
-                  `(policy v${report.selinux_policy_version}, mode: ${report.selinux_mode})`);
+                  `(policy v${report.selinux_policy_version}, wnc_local v${report.wnc_local_version || '?'}, mode: ${report.selinux_mode})`);
       res.json({ status: 'ok', received: report.denial_count || 0 });
     });
 
@@ -290,6 +306,72 @@ async function startMqttServer() {
         });
       }
       res.json({ total_devices: summary.length, devices: summary });
+    });
+
+    // GET /api/avc-files  — list all device folders with file counts and latest report metadata
+    app.get('/api/avc-files', (req, res) => {
+      try {
+        const devices = fs.existsSync(AVC_DIR)
+          ? fs.readdirSync(AVC_DIR).filter(d => fs.statSync(path.join(AVC_DIR, d)).isDirectory())
+          : [];
+        const summary = devices.map(deviceId => {
+          const deviceDir = path.join(AVC_DIR, deviceId);
+          const files = fs.readdirSync(deviceDir).filter(f => f.endsWith('.json')).sort();
+          const latest = files.length > 0 ? files[files.length - 1] : null;
+          let latestMeta = {};
+          if (latest) {
+            try {
+              const data = JSON.parse(fs.readFileSync(path.join(deviceDir, latest)));
+              latestMeta = {
+                upload_timestamp: data.upload_timestamp,
+                denial_count: data.denial_count,
+                selinux_mode: data.selinux_mode,
+                selinux_policy_version: data.selinux_policy_version,
+                wnc_local_version: data.wnc_local_version,
+                firmware_version: data.firmware_version
+              };
+            } catch (_) {}
+          }
+          return { device_id: deviceId, file_count: files.length, latest_file: latest, ...latestMeta };
+        });
+        res.json({ total_devices: summary.length, devices: summary });
+      } catch (e) {
+        res.status(500).json({ error: e.message });
+      }
+    });
+
+    // GET /api/avc-files/:deviceId  — list all report files for a specific device
+    app.get('/api/avc-files/:deviceId', (req, res) => {
+      const deviceDir = path.join(AVC_DIR, req.params.deviceId);
+      if (!fs.existsSync(deviceDir)) return res.json({ device_id: req.params.deviceId, files: [] });
+      try {
+        const files = fs.readdirSync(deviceDir).filter(f => f.endsWith('.json')).sort().reverse();
+        const fileList = files.map(f => {
+          const fp = path.join(deviceDir, f);
+          const stat = fs.statSync(fp);
+          let meta = {};
+          try {
+            const data = JSON.parse(fs.readFileSync(fp));
+            meta = { upload_timestamp: data.upload_timestamp, denial_count: data.denial_count,
+                     selinux_mode: data.selinux_mode, wnc_local_version: data.wnc_local_version };
+          } catch (_) {}
+          return { filename: f, size_bytes: stat.size, ...meta };
+        });
+        res.json({ device_id: req.params.deviceId, file_count: fileList.length, files: fileList });
+      } catch (e) {
+        res.status(500).json({ error: e.message });
+      }
+    });
+
+    // GET /api/avc-files/:deviceId/:filename  — download a specific report JSON file
+    app.get('/api/avc-files/:deviceId/:filename', (req, res) => {
+      const filePath = path.join(AVC_DIR, req.params.deviceId, req.params.filename);
+      if (!fs.existsSync(filePath) || !req.params.filename.endsWith('.json')) {
+        return res.status(404).json({ error: 'File not found' });
+      }
+      res.setHeader('Content-Type', 'application/json');
+      res.setHeader('Content-Disposition', `attachment; filename="${req.params.filename}"`);
+      fs.createReadStream(filePath).pipe(res);
     });
 
     // POST /api/avc-request/:deviceId  — request immediate upload from a device (via MQTT)
