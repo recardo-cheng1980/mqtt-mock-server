@@ -30,12 +30,66 @@ async function startMqttServer() {
     // Track connected MQTT clients
     const connectedClients = new Map();
 
-    // AVC denial report store — Map<deviceId, AvcReport[]>, keeps last 100 reports per device
+    // AVC denial report store — Map<deviceId, MergedState>
+    // MergedState: { device_id, first/last_upload_timestamp, last_received_at, upload_count,
+    //   total_raw_denials, firmware metadata fields, denialMap: Map<key, denialEntry> }
     const avcStore = new Map();
+    const MERGED_FILENAME = 'avc-denials.json';
 
     // Persistent storage directory for AVC reports (survives server restarts)
     const AVC_DIR = path.join(__dirname, 'avc-reports');
     if (!fs.existsSync(AVC_DIR)) fs.mkdirSync(AVC_DIR, { recursive: true });
+
+    // Dedup key — mirrors selinux-avc-reporter.py: (scontext, tcontext, tclass, sorted_perms)
+    function denialKey(d) {
+      const perms = Array.isArray(d.perms) ? [...d.perms].sort().join(',') : String(d.perms || '');
+      return `${d.scontext}|${d.tcontext}|${d.tclass}|${perms}`;
+    }
+
+    // Lazy-load merged state from avc-denials.json on first POST for a device
+    function loadMergedState(deviceId) {
+      const filePath = path.join(AVC_DIR, deviceId, MERGED_FILENAME);
+      if (!fs.existsSync(filePath)) return null;
+      try {
+        const disk = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+        const denialMap = new Map();
+        (disk.denials || []).forEach(d => denialMap.set(denialKey(d), d));
+        return { ...disk, denialMap };
+      } catch (e) {
+        console.error(`[AVC] Failed to load merged state for ${deviceId}:`, e.message);
+        return null;
+      }
+    }
+
+    // Write merged state atomically (tmp → rename) to avc-denials.json
+    function saveMergedState(merged) {
+      const deviceDir = path.join(AVC_DIR, merged.device_id);
+      if (!fs.existsSync(deviceDir)) fs.mkdirSync(deviceDir, { recursive: true });
+      const denials = Array.from(merged.denialMap.values())
+        .sort((a, b) => (b.occurrence_count || 0) - (a.occurrence_count || 0));
+      const diskState = {
+        device_id:                 merged.device_id,
+        first_upload_timestamp:    merged.first_upload_timestamp,
+        last_upload_timestamp:     merged.last_upload_timestamp,
+        last_received_at:          merged.last_received_at,
+        upload_count:              merged.upload_count,
+        total_raw_denials:         merged.total_raw_denials,
+        total_unique_denial_types: denials.length,
+        firmware_version:          merged.firmware_version,
+        fw_build:                  merged.fw_build,
+        selinux_policy_version:    merged.selinux_policy_version,
+        wnc_local_version:         merged.wnc_local_version,
+        wnc_local_te_lines:        merged.wnc_local_te_lines,
+        wnc_local_fc_lines:        merged.wnc_local_fc_lines,
+        selinux_mode:              merged.selinux_mode,
+        denials
+      };
+      const finalPath = path.join(deviceDir, MERGED_FILENAME);
+      const tmpPath   = finalPath + '.tmp';
+      fs.writeFileSync(tmpPath, JSON.stringify(diskState, null, 2));
+      fs.renameSync(tmpPath, finalPath);
+      return diskState;
+    }
 
     server.listen(PORT, function () {
       console.log(`MQTT mTLS 伺服器已啟動，正在監聽連接埠 ${PORT}`);
@@ -243,9 +297,9 @@ async function startMqttServer() {
     });
 
     // ── SELinux AVC Denial Reporting Endpoints ──────────────────────────────
-    // DUT posts JSON batches via HTTPS; no MQTT cert dependency required.
+    // DUT posts JSON batches; server merges into a single avc-denials.json per device.
 
-    // POST /api/avc-report  — receive AVC denial batch from any device
+    // POST /api/avc-report  — receive AVC denial batch and merge into single per-device file
     app.post('/api/avc-report', (req, res) => {
       const report = req.body;
 
@@ -253,87 +307,160 @@ async function startMqttServer() {
         return res.status(400).json({ error: 'Missing required field: device_id' });
       }
 
-      report.received_at = new Date().toISOString();
-      const deviceId = report.device_id;
+      const deviceId   = report.device_id;
+      const receivedAt = new Date().toISOString();
 
-      if (!avcStore.has(deviceId)) avcStore.set(deviceId, []);
-      const reports = avcStore.get(deviceId);
-      reports.push(report);
-      if (reports.length > 100) reports.shift();  // keep last 100 per device
-
-      // Persist to disk: ./avc-reports/<deviceId>/<safe_timestamp>.json
-      try {
-        const safeTs = (report.upload_timestamp || report.received_at).replace(/[:.]/g, '-');
-        const deviceDir = path.join(AVC_DIR, deviceId);
-        if (!fs.existsSync(deviceDir)) fs.mkdirSync(deviceDir, { recursive: true });
-        const filePath = path.join(deviceDir, `${safeTs}.json`);
-        fs.writeFileSync(filePath, JSON.stringify(report, null, 2));
-        console.log(`[AVC] Saved ${report.denial_count || 0} denials from ${deviceId} → ${path.basename(filePath)}`);
-      } catch (e) {
-        console.error('[AVC] Failed to persist report to disk:', e.message);
+      // Lazy-load merged state from disk if not in memory
+      if (!avcStore.has(deviceId)) {
+        const disk = loadMergedState(deviceId);
+        if (disk) {
+          avcStore.set(deviceId, disk);
+        } else {
+          avcStore.set(deviceId, {
+            device_id:              deviceId,
+            first_upload_timestamp: report.upload_timestamp || receivedAt,
+            last_upload_timestamp:  null,
+            last_received_at:       null,
+            upload_count:           0,
+            total_raw_denials:      0,
+            denialMap:              new Map()
+          });
+        }
       }
 
-      console.log(`[AVC] Received from ${deviceId}: ${report.denial_count || 0} unique types` +
-                  ` (${report.raw_denial_count || '?'} raw records)` +
-                  ` | policy v${report.selinux_policy_version}, wnc_local v${report.wnc_local_version || '?'}, mode: ${report.selinux_mode}`);
-      res.json({ status: 'ok', unique_types: report.denial_count || 0, raw_records: report.raw_denial_count || 0 });
+      const merged = avcStore.get(deviceId);
+      const incomingDenials = report.denials || [];
+      let newTypes = 0;
+
+      for (const d of incomingDenials) {
+        const key = denialKey(d);
+        if (merged.denialMap.has(key)) {
+          const existing = merged.denialMap.get(key);
+          existing.occurrence_count = (existing.occurrence_count || 1) + (d.occurrence_count || 1);
+          if (d.first_seen && (!existing.first_seen || d.first_seen < existing.first_seen))
+            existing.first_seen = d.first_seen;
+          if (d.last_seen && (!existing.last_seen || d.last_seen > existing.last_seen))
+            existing.last_seen = d.last_seen;
+        } else {
+          merged.denialMap.set(key, { ...d });
+          newTypes++;
+        }
+      }
+
+      // Accumulate counters and refresh metadata from this upload
+      merged.upload_count    = (merged.upload_count || 0) + 1;
+      merged.total_raw_denials = (merged.total_raw_denials || 0) + (report.raw_denial_count || 0);
+      merged.last_upload_timestamp = report.upload_timestamp || receivedAt;
+      merged.last_received_at      = receivedAt;
+      merged.firmware_version      = report.firmware_version;
+      merged.fw_build              = report.fw_build;
+      merged.selinux_policy_version = report.selinux_policy_version;
+      merged.wnc_local_version     = report.wnc_local_version;
+      merged.wnc_local_te_lines    = report.wnc_local_te_lines;
+      merged.wnc_local_fc_lines    = report.wnc_local_fc_lines;
+      merged.selinux_mode          = report.selinux_mode;
+
+      let savedState = null;
+      try {
+        savedState = saveMergedState(merged);
+        console.log(`[AVC] ${deviceId}: +${incomingDenials.length} incoming (+${newTypes} new) ` +
+                    `→ ${merged.denialMap.size} total unique types (upload #${merged.upload_count})`);
+      } catch (e) {
+        console.error('[AVC] Failed to persist merged state:', e.message);
+      }
+
+      res.json({
+        status:                'ok',
+        incoming_unique_types: incomingDenials.length,
+        new_types_added:       newTypes,
+        total_unique_types:    merged.denialMap.size,
+        upload_count:          merged.upload_count
+      });
     });
 
-    // GET /api/avc-report/:deviceId  — query stored reports for a specific device
+    // GET /api/avc-report/:deviceId  — return merged denial set for a device
     app.get('/api/avc-report/:deviceId', (req, res) => {
       const deviceId = req.params.deviceId;
-      const reports = avcStore.get(deviceId) || [];
+      let merged = avcStore.get(deviceId);
+      if (!merged) {
+        const disk = loadMergedState(deviceId);
+        if (!disk) return res.json({ device_id: deviceId, upload_count: 0, denials: [] });
+        avcStore.set(deviceId, disk);
+        merged = disk;
+      }
+      const denials = Array.from(merged.denialMap.values())
+        .sort((a, b) => (b.occurrence_count || 0) - (a.occurrence_count || 0));
       res.json({
-        device_id: deviceId,
-        report_count: reports.length,
-        reports
+        device_id:                 merged.device_id,
+        first_upload_timestamp:    merged.first_upload_timestamp,
+        last_upload_timestamp:     merged.last_upload_timestamp,
+        last_received_at:          merged.last_received_at,
+        upload_count:              merged.upload_count,
+        total_raw_denials:         merged.total_raw_denials,
+        total_unique_denial_types: denials.length,
+        firmware_version:          merged.firmware_version,
+        selinux_policy_version:    merged.selinux_policy_version,
+        wnc_local_version:         merged.wnc_local_version,
+        selinux_mode:              merged.selinux_mode,
+        denials
       });
     });
 
     // GET /api/avc-report  — summary of all devices with AVC data
     app.get('/api/avc-report', (req, res) => {
-      const summary = [];
-      for (const [deviceId, reports] of avcStore.entries()) {
-        const latest = reports[reports.length - 1];
-        summary.push({
-          device_id: deviceId,
-          report_count: reports.length,
-          latest_upload: latest?.upload_timestamp,
-          latest_received: latest?.received_at,
-          latest_denial_count: latest?.denial_count,
-          selinux_mode: latest?.selinux_mode,
-          policy_version: latest?.selinux_policy_version,
-          firmware_version: latest?.firmware_version
-        });
-      }
+      // Scan disk so we surface devices that exist on disk but not yet in avcStore
+      const onDisk = fs.existsSync(AVC_DIR)
+        ? fs.readdirSync(AVC_DIR)
+            .filter(d => fs.existsSync(path.join(AVC_DIR, d, MERGED_FILENAME)))
+        : [];
+      const summary = onDisk.map(deviceId => {
+        try {
+          const data = JSON.parse(fs.readFileSync(path.join(AVC_DIR, deviceId, MERGED_FILENAME), 'utf8'));
+          return {
+            device_id:                 deviceId,
+            upload_count:              data.upload_count,
+            last_upload_timestamp:     data.last_upload_timestamp,
+            last_received_at:          data.last_received_at,
+            total_unique_denial_types: data.total_unique_denial_types,
+            total_raw_denials:         data.total_raw_denials,
+            selinux_mode:              data.selinux_mode,
+            selinux_policy_version:    data.selinux_policy_version,
+            firmware_version:          data.firmware_version
+          };
+        } catch (_) {
+          return { device_id: deviceId };
+        }
+      });
       res.json({ total_devices: summary.length, devices: summary });
     });
 
-    // GET /api/avc-files  — list all device folders with file counts and latest report metadata
+    // GET /api/avc-files  — list each device's single merged file
     app.get('/api/avc-files', (req, res) => {
       try {
         const devices = fs.existsSync(AVC_DIR)
           ? fs.readdirSync(AVC_DIR).filter(d => fs.statSync(path.join(AVC_DIR, d)).isDirectory())
           : [];
         const summary = devices.map(deviceId => {
-          const deviceDir = path.join(AVC_DIR, deviceId);
-          const files = fs.readdirSync(deviceDir).filter(f => f.endsWith('.json')).sort();
-          const latest = files.length > 0 ? files[files.length - 1] : null;
-          let latestMeta = {};
-          if (latest) {
-            try {
-              const data = JSON.parse(fs.readFileSync(path.join(deviceDir, latest)));
-              latestMeta = {
-                upload_timestamp: data.upload_timestamp,
-                denial_count: data.denial_count,
-                selinux_mode: data.selinux_mode,
-                selinux_policy_version: data.selinux_policy_version,
-                wnc_local_version: data.wnc_local_version,
-                firmware_version: data.firmware_version
-              };
-            } catch (_) {}
+          const filePath = path.join(AVC_DIR, deviceId, MERGED_FILENAME);
+          if (!fs.existsSync(filePath)) return { device_id: deviceId, file: null };
+          try {
+            const stat = fs.statSync(filePath);
+            const data = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+            return {
+              device_id:                 deviceId,
+              file:                      MERGED_FILENAME,
+              size_bytes:                stat.size,
+              upload_count:              data.upload_count,
+              last_upload_timestamp:     data.last_upload_timestamp,
+              total_unique_denial_types: data.total_unique_denial_types,
+              selinux_mode:              data.selinux_mode,
+              selinux_policy_version:    data.selinux_policy_version,
+              wnc_local_version:         data.wnc_local_version,
+              firmware_version:          data.firmware_version
+            };
+          } catch (_) {
+            return { device_id: deviceId, file: MERGED_FILENAME };
           }
-          return { device_id: deviceId, file_count: files.length, latest_file: latest, ...latestMeta };
         });
         res.json({ total_devices: summary.length, devices: summary });
       } catch (e) {
@@ -341,24 +468,31 @@ async function startMqttServer() {
       }
     });
 
-    // GET /api/avc-files/:deviceId  — list all report files for a specific device
+    // GET /api/avc-files/:deviceId  — metadata for the single merged file of a device
     app.get('/api/avc-files/:deviceId', (req, res) => {
-      const deviceDir = path.join(AVC_DIR, req.params.deviceId);
-      if (!fs.existsSync(deviceDir)) return res.json({ device_id: req.params.deviceId, files: [] });
+      const deviceId = req.params.deviceId;
+      const filePath = path.join(AVC_DIR, deviceId, MERGED_FILENAME);
+      if (!fs.existsSync(filePath)) {
+        return res.json({ device_id: deviceId, file: null });
+      }
       try {
-        const files = fs.readdirSync(deviceDir).filter(f => f.endsWith('.json')).sort().reverse();
-        const fileList = files.map(f => {
-          const fp = path.join(deviceDir, f);
-          const stat = fs.statSync(fp);
-          let meta = {};
-          try {
-            const data = JSON.parse(fs.readFileSync(fp));
-            meta = { upload_timestamp: data.upload_timestamp, denial_count: data.denial_count,
-                     selinux_mode: data.selinux_mode, wnc_local_version: data.wnc_local_version };
-          } catch (_) {}
-          return { filename: f, size_bytes: stat.size, ...meta };
+        const stat = fs.statSync(filePath);
+        const data = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+        res.json({
+          device_id:                 deviceId,
+          file:                      MERGED_FILENAME,
+          size_bytes:                stat.size,
+          upload_count:              data.upload_count,
+          first_upload_timestamp:    data.first_upload_timestamp,
+          last_upload_timestamp:     data.last_upload_timestamp,
+          last_received_at:          data.last_received_at,
+          total_unique_denial_types: data.total_unique_denial_types,
+          total_raw_denials:         data.total_raw_denials,
+          selinux_mode:              data.selinux_mode,
+          selinux_policy_version:    data.selinux_policy_version,
+          wnc_local_version:         data.wnc_local_version,
+          firmware_version:          data.firmware_version
         });
-        res.json({ device_id: req.params.deviceId, file_count: fileList.length, files: fileList });
       } catch (e) {
         res.status(500).json({ error: e.message });
       }
