@@ -525,6 +525,42 @@ async function startMqttServer() {
         res.json({ status: 'ok', message: `Upload request sent to ${deviceId}` });
       });
     });
+    // GET /api/avc-download  — single combined file with all devices' merged AVC denials
+    app.get('/api/avc-download', (req, res) => {
+      try {
+        const devices = fs.existsSync(AVC_DIR)
+          ? fs.readdirSync(AVC_DIR).filter(d => fs.statSync(path.join(AVC_DIR, d)).isDirectory())
+          : [];
+
+        const combined = {
+          generated_at: new Date().toISOString(),
+          total_devices: 0,
+          total_unique_denial_types: 0,
+          total_raw_denials: 0,
+          devices: []
+        };
+
+        for (const deviceId of devices) {
+          const filePath = path.join(AVC_DIR, deviceId, MERGED_FILENAME);
+          if (!fs.existsSync(filePath)) continue;
+          try {
+            const data = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+            combined.devices.push(data);
+            combined.total_unique_denial_types += data.total_unique_denial_types || 0;
+            combined.total_raw_denials         += data.total_raw_denials || 0;
+          } catch (_) {}
+        }
+        combined.total_devices = combined.devices.length;
+
+        const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+        res.setHeader('Content-Type', 'application/json');
+        res.setHeader('Content-Disposition', `attachment; filename="avc-denials-combined-${ts}.json"`);
+        res.json(combined);
+      } catch (e) {
+        console.error('[AVC] avc-download failed:', e.message);
+        res.status(500).json({ error: e.message });
+      }
+    });
     // ────────────────────────────────────────────────────────────────────────
 
     // 3. 啟動 HTTP 伺服器 (強烈建議綁定 127.0.0.1 確保僅限本機存取)
