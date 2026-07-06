@@ -411,7 +411,7 @@ async function startMqttServer() {
       // Scan disk so we surface devices that exist on disk but not yet in avcStore
       const onDisk = fs.existsSync(AVC_DIR)
         ? fs.readdirSync(AVC_DIR)
-            .filter(d => fs.existsSync(path.join(AVC_DIR, d, MERGED_FILENAME)))
+            .filter(d => d !== 'backup' && fs.existsSync(path.join(AVC_DIR, d, MERGED_FILENAME)))
         : [];
       const summary = onDisk.map(deviceId => {
         try {
@@ -438,7 +438,7 @@ async function startMqttServer() {
     app.get('/api/avc-files', (req, res) => {
       try {
         const devices = fs.existsSync(AVC_DIR)
-          ? fs.readdirSync(AVC_DIR).filter(d => fs.statSync(path.join(AVC_DIR, d)).isDirectory())
+          ? fs.readdirSync(AVC_DIR).filter(d => d !== 'backup' && fs.statSync(path.join(AVC_DIR, d)).isDirectory())
           : [];
         const summary = devices.map(deviceId => {
           const filePath = path.join(AVC_DIR, deviceId, MERGED_FILENAME);
@@ -525,11 +525,13 @@ async function startMqttServer() {
         res.json({ status: 'ok', message: `Upload request sent to ${deviceId}` });
       });
     });
-    // GET /api/avc-download  — single combined file with all devices' merged AVC denials
+    // GET /api/avc-download  — single combined file with all devices' merged AVC denials.
+    // After sending the response the originals are moved to avc-reports/backup/<timestamp>/
+    // and cleared from the in-memory cache so the next upload cycle starts fresh.
     app.get('/api/avc-download', (req, res) => {
       try {
         const devices = fs.existsSync(AVC_DIR)
-          ? fs.readdirSync(AVC_DIR).filter(d => fs.statSync(path.join(AVC_DIR, d)).isDirectory())
+          ? fs.readdirSync(AVC_DIR).filter(d => d !== 'backup' && fs.statSync(path.join(AVC_DIR, d)).isDirectory())
           : [];
 
         const combined = {
@@ -540,6 +542,8 @@ async function startMqttServer() {
           devices: []
         };
 
+        // Collect which files were successfully read so we know what to back up
+        const toBackup = [];
         for (const deviceId of devices) {
           const filePath = path.join(AVC_DIR, deviceId, MERGED_FILENAME);
           if (!fs.existsSync(filePath)) continue;
@@ -548,11 +552,31 @@ async function startMqttServer() {
             combined.devices.push(data);
             combined.total_unique_denial_types += data.total_unique_denial_types || 0;
             combined.total_raw_denials         += data.total_raw_denials || 0;
+            toBackup.push({ deviceId, filePath });
           } catch (_) {}
         }
         combined.total_devices = combined.devices.length;
 
         const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+
+        // After the response is fully sent: move originals to backup/, clear cache
+        res.on('finish', () => {
+          if (toBackup.length === 0) return;
+          const backupDir = path.join(AVC_DIR, 'backup', ts);
+          try {
+            fs.mkdirSync(backupDir, { recursive: true });
+            for (const { deviceId, filePath } of toBackup) {
+              const destDir = path.join(backupDir, deviceId);
+              fs.mkdirSync(destDir, { recursive: true });
+              fs.renameSync(filePath, path.join(destDir, MERGED_FILENAME));
+              avcStore.delete(deviceId);
+            }
+            console.log(`[AVC] download: ${toBackup.length} file(s) moved to backup/${ts}/`);
+          } catch (e) {
+            console.error('[AVC] backup after download failed:', e.message);
+          }
+        });
+
         res.setHeader('Content-Type', 'application/json');
         res.setHeader('Content-Disposition', `attachment; filename="avc-denials-combined-${ts}.json"`);
         res.json(combined);
