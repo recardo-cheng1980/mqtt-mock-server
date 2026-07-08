@@ -1,4 +1,5 @@
 const tls = require('tls');
+const https = require('node:https');
 const fs = require('fs');
 const path = require('path');
 
@@ -295,6 +296,116 @@ async function startMqttServer() {
         });
       });
     });
+
+    // ── SSH Certificate Authority: user login cert signing ─────────────────
+    // Signs SSH login certificates directly against Vault's SSH secrets
+    // engine, using this server's OWN dedicated Vault credential — NOT any
+    // device's TPM-provisioned AppRole. The DUT is never involved in this
+    // request path at all; it only ever trusts the resulting CA public key
+    // (fetched separately by kms-cert-manager's own read-only Vault call).
+    // See docs/kms/ssh-ca-user-and-host-certs-plan.md in the uct-iq9075 repo.
+    //
+    // Required env vars (set via Portainer stack config — never commit
+    // real values to this repo):
+    //   VAULT_ADDR         e.g. https://vault.csyang.org
+    //   VAULT_TOKEN        token scoped ONLY to ssh/sign/user-login —
+    //                      must NOT be shared with any device's own AppRole
+    //   VAULT_SSH_MOUNT    defaults to "ssh"
+    //   VAULT_SSH_ROLE     defaults to "user-login"
+    //   SSH_SIGN_API_KEY   shared secret required in the X-SSH-Sign-Key
+    //                      header. If unset, this endpoint refuses every
+    //                      request (fails closed) rather than silently
+    //                      allowing unauthenticated issuance of human login
+    //                      credentials — that blast radius is categorically
+    //                      different from the other endpoints above.
+    function vaultSshSign(publicKey, principal, engineerId, ttl) {
+      return new Promise((resolve, reject) => {
+        const vaultAddr = process.env.VAULT_ADDR;
+        const vaultToken = process.env.VAULT_TOKEN;
+        if (!vaultAddr || !vaultToken) {
+          return reject(new Error('VAULT_ADDR/VAULT_TOKEN not configured on this server'));
+        }
+        const mount = process.env.VAULT_SSH_MOUNT || 'ssh';
+        const role = process.env.VAULT_SSH_ROLE || 'user-login';
+
+        // principal = which local account the cert may log in as (authorization).
+        // engineerId = the actual requesting human, wired through as Vault's
+        // key_id — deliberately distinct fields. Conflating the two would
+        // silently defeat the IEC 62443 SR 6.1 non-repudiation requirement
+        // this endpoint exists to satisfy (sshd logs the Key ID on every
+        // successful cert login, so this is what makes "who logged in as
+        // the shared account, and when" traceable).
+        const body = JSON.stringify({
+          public_key: publicKey,
+          valid_principals: principal,
+          key_id: engineerId,
+          cert_type: 'user',
+          ...(ttl ? { ttl } : {})
+        });
+
+        const url = new URL(`/v1/${mount}/sign/${role}`, vaultAddr);
+        const vaultReq = https.request(url, {
+          method: 'PUT',
+          headers: {
+            'X-Vault-Token': vaultToken,
+            'Content-Type': 'application/json',
+            'Content-Length': Buffer.byteLength(body)
+          }
+        }, (vaultRes) => {
+          let data = '';
+          vaultRes.on('data', (chunk) => { data += chunk; });
+          vaultRes.on('end', () => {
+            let parsed;
+            try {
+              parsed = JSON.parse(data);
+            } catch (e) {
+              return reject(new Error(`Vault returned non-JSON response (HTTP ${vaultRes.statusCode}): ${data}`));
+            }
+            if (vaultRes.statusCode !== 200) {
+              const errMsg = (parsed.errors || []).join('; ') || `HTTP ${vaultRes.statusCode}`;
+              return reject(new Error(`Vault SSH sign failed: ${errMsg}`));
+            }
+            if (!parsed.data || !parsed.data.signed_key) {
+              return reject(new Error(`Unexpected Vault response: ${data}`));
+            }
+            resolve(parsed.data.signed_key);
+          });
+        });
+        vaultReq.on('error', reject);
+        vaultReq.write(body);
+        vaultReq.end();
+      });
+    }
+
+    app.post('/api/ssh-sign', (req, res) => {
+      const apiKey = process.env.SSH_SIGN_API_KEY;
+      if (!apiKey) {
+        console.error('[ssh-sign] SSH_SIGN_API_KEY not configured — refusing all requests (fail closed)');
+        return res.status(503).json({ status: 'error', message: 'ssh-sign endpoint not configured' });
+      }
+      if (req.get('X-SSH-Sign-Key') !== apiKey) {
+        return res.status(401).json({ status: 'error', message: 'unauthorized' });
+      }
+
+      const { public_key, principal, engineer_id, ttl } = req.body || {};
+      if (!public_key || !principal || !engineer_id) {
+        return res.status(400).json({
+          status: 'error',
+          message: 'Missing required fields: public_key, principal, engineer_id'
+        });
+      }
+
+      vaultSshSign(public_key, principal, engineer_id, ttl)
+        .then((signedKey) => {
+          console.log(`[ssh-sign] Issued cert for engineer_id=${engineer_id} principal=${principal}`);
+          res.json({ status: 'ok', certificate: signedKey });
+        })
+        .catch((err) => {
+          console.error('[ssh-sign] Vault sign failed:', err.message);
+          res.status(502).json({ status: 'error', message: err.message });
+        });
+    });
+    // ────────────────────────────────────────────────────────────────────────
 
     // ── SELinux AVC Denial Reporting Endpoints ──────────────────────────────
     // DUT posts JSON batches; server merges into a single avc-denials.json per device.

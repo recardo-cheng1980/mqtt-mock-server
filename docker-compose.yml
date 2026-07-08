@@ -7,4 +7,13 @@ services:
     volumes:
       - /etc/app/certs:/app/certs:ro
       - /home/ext_recardo_cheng_gmail_com/avc-report:/app/avc-reports
+    environment:
+      # /api/ssh-sign — values come from Portainer's stack environment
+      # config (or a host-side .env untracked by git), never committed here.
+      # Endpoint fails closed (503) if these are unset, see mqtt.js.
+      - VAULT_ADDR=${VAULT_ADDR:-}
+      - VAULT_TOKEN=${VAULT_TOKEN:-}
+      - VAULT_SSH_MOUNT=${VAULT_SSH_MOUNT:-ssh}
+      - VAULT_SSH_ROLE=${VAULT_SSH_ROLE:-user-login}
+      - SSH_SIGN_API_KEY=${SSH_SIGN_API_KEY:-}
     restart: always
