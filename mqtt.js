@@ -328,7 +328,9 @@ async function startMqttServer() {
         const mount = process.env.VAULT_SSH_MOUNT || 'ssh';
         const role = process.env.VAULT_SSH_ROLE || 'user-login';
 
-        // principal = which local account the cert may log in as (authorization).
+        // principal = which local account the cert may log in as (authorization),
+        // already device-scoped ("<role>@<device_id>") by the caller below so
+        // this cert cannot be reused to log into a different device.
         // engineerId = the actual requesting human, wired through as Vault's
         // key_id — deliberately distinct fields. Conflating the two would
         // silently defeat the IEC 62443 SR 6.1 non-repudiation requirement
@@ -377,6 +379,15 @@ async function startMqttServer() {
       });
     }
 
+    // Local accounts a cert may claim. Vault's user-login role allows any
+    // username (allowed_users=*) because device-scoped principals
+    // (admin@<device_id>) can't be enumerated per-device in Vault without
+    // manual admin work for every new device — so this allowlist is now
+    // the real enforcement point for "which role names are legitimate",
+    // not Vault. Keep this narrow and update deliberately, not blanket.
+    const ALLOWED_PRINCIPAL_ROLES = ['admin'];
+    const DEVICE_ID_PATTERN = /^kms-[a-zA-Z0-9]+$/;
+
     app.post('/api/ssh-sign', (req, res) => {
       const apiKey = process.env.SSH_SIGN_API_KEY;
       if (!apiKey) {
@@ -387,17 +398,30 @@ async function startMqttServer() {
         return res.status(401).json({ status: 'error', message: 'unauthorized' });
       }
 
-      const { public_key, principal, engineer_id, ttl } = req.body || {};
-      if (!public_key || !principal || !engineer_id) {
+      const { public_key, principal, device_id, engineer_id, ttl } = req.body || {};
+      if (!public_key || !principal || !device_id || !engineer_id) {
         return res.status(400).json({
           status: 'error',
-          message: 'Missing required fields: public_key, principal, engineer_id'
+          message: 'Missing required fields: public_key, principal, device_id, engineer_id'
         });
       }
+      if (!ALLOWED_PRINCIPAL_ROLES.includes(principal)) {
+        return res.status(400).json({ status: 'error', message: `Unknown principal role: ${principal}` });
+      }
+      if (!DEVICE_ID_PATTERN.test(device_id)) {
+        return res.status(400).json({ status: 'error', message: `Invalid device_id: ${device_id}` });
+      }
 
-      vaultSshSign(public_key, principal, engineer_id, ttl)
+      // Device-scoped principal: a cert issued for one device must not be
+      // usable to log into a different device running the same image.
+      // Each device's own /etc/ssh/auth_principals/<account> only lists
+      // its own "<role>@<device_id>" (see kms-cert-manager's
+      // _do_rotate_ssh_ca), so this cert will only match on device_id.
+      const scopedPrincipal = `${principal}@${device_id}`;
+
+      vaultSshSign(public_key, scopedPrincipal, engineer_id, ttl)
         .then((signedKey) => {
-          console.log(`[ssh-sign] Issued cert for engineer_id=${engineer_id} principal=${principal}`);
+          console.log(`[ssh-sign] Issued cert for engineer_id=${engineer_id} principal=${scopedPrincipal}`);
           res.json({ status: 'ok', certificate: signedKey });
         })
         .catch((err) => {
