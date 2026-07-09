@@ -485,15 +485,14 @@ async function startMqttServer() {
         return res.status(400).json({ status: 'error', message: `Invalid device_id: ${deviceId}` });
       }
 
-      // Fast-fail if the device isn't currently connected, rather than
-      // always waiting out the full timeout. Assumes connectedClients is
-      // keyed by the same string as deviceId (MQTT client.id) — verify
-      // this holds on real hardware; if it doesn't, this check is simply
-      // never true and every request falls through to the timeout path.
-      if (!connectedClients.has(deviceId)) {
-        return res.status(409).json({ status: 'error', message: `${deviceId} is not currently connected` });
-      }
-
+      // No online fast-fail check: verified on real hardware that
+      // connectedClients is keyed by kms-mqtt-trigger's MQTT client_id
+      // (`kms-${device_id.slice(0,12)}`, kms-mqtt-trigger.py:596), not the
+      // device_id itself — e.g. device "kms-4077732621" connects as
+      // "kms-kms-40777326". That mapping is lossy (device_id is truncated
+      // to 12 chars, so distinct devices could even collide), so
+      // reconstructing it here would be fragile and misleading. Rely on
+      // the timeout below instead of a broken "is it connected" check.
       const requestId = crypto.randomUUID();
       const key = `${deviceId}:${requestId}`;
       const packet = {
