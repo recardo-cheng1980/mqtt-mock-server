@@ -2,6 +2,7 @@ const tls = require('tls');
 const https = require('node:https');
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 
 // 2. 變更：必須使用 async 函數來包裝初始化邏輯
 async function startMqttServer() {
@@ -30,6 +31,12 @@ async function startMqttServer() {
 
     // Track connected MQTT clients
     const connectedClients = new Map();
+
+    // Pending /api/ssh-host-renew requests awaiting a correlated
+    // kms/<deviceId>/result message. Keyed by `${deviceId}:${requestId}`,
+    // value { resolve, timer }. See the aedes.on('publish', ...) hook below
+    // and the /api/ssh-host-renew route.
+    const pendingSshHostRenewals = new Map();
 
     // AVC denial report store — Map<deviceId, MergedState>
     // MergedState: { device_id, first/last_upload_timestamp, last_received_at, upload_count,
@@ -168,6 +175,30 @@ async function startMqttServer() {
     aedes.on('publish', function (packet, client) {
       if (client) {
         console.log(`收到來自 ${client.id} 的訊息，主題: ${packet.topic}`);
+      }
+
+      // Correlate DUT result messages back to a pending /api/ssh-host-renew
+      // request. kms-mqtt-trigger publishes to kms/<deviceId>/result with
+      // whatever JSON kms-cert-manager returned, including the request_id
+      // we sent it (see kms-cert-manager.py's _handle_client echo).
+      const resultMatch = /^kms\/([^/]+)\/result$/.exec(packet.topic);
+      if (resultMatch) {
+        const deviceId = resultMatch[1];
+        let payload;
+        try {
+          payload = JSON.parse(packet.payload.toString());
+        } catch (e) {
+          return;
+        }
+        if (payload && payload.request_id) {
+          const key = `${deviceId}:${payload.request_id}`;
+          const pending = pendingSshHostRenewals.get(key);
+          if (pending) {
+            clearTimeout(pending.timer);
+            pendingSshHostRenewals.delete(key);
+            pending.resolve(payload);
+          }
+        }
       }
     });
 
@@ -427,6 +458,78 @@ async function startMqttServer() {
         .catch((err) => {
           console.error('[ssh-sign] Vault sign failed:', err.message);
           res.status(502).json({ status: 'error', message: err.message });
+        });
+    });
+
+    // Trigger an SSH host-certificate renewal on a specific device over
+    // MQTT, waiting for the DUT's actual result instead of firing and
+    // forgetting like /api/rotate. Replaces kms-ssh-host-cert-renew.timer
+    // (removed on the DUT side) as the only renewal path — see
+    // docs/kms/ssh-ca-user-and-host-certs-plan.md. Reuses the same
+    // X-SSH-Sign-Key auth as /api/ssh-sign since this changes host-identity
+    // trust, a more consequential action than the open /api/rotate.
+    const SSH_HOST_RENEW_TIMEOUT_MS = 25000;
+
+    app.post('/api/ssh-host-renew/:deviceId', (req, res) => {
+      const apiKey = process.env.SSH_SIGN_API_KEY;
+      if (!apiKey) {
+        console.error('[ssh-host-renew] SSH_SIGN_API_KEY not configured — refusing all requests (fail closed)');
+        return res.status(503).json({ status: 'error', message: 'ssh-host-renew endpoint not configured' });
+      }
+      if (req.get('X-SSH-Sign-Key') !== apiKey) {
+        return res.status(401).json({ status: 'error', message: 'unauthorized' });
+      }
+
+      const deviceId = req.params.deviceId;
+      if (!DEVICE_ID_PATTERN.test(deviceId)) {
+        return res.status(400).json({ status: 'error', message: `Invalid device_id: ${deviceId}` });
+      }
+
+      // Fast-fail if the device isn't currently connected, rather than
+      // always waiting out the full timeout. Assumes connectedClients is
+      // keyed by the same string as deviceId (MQTT client.id) — verify
+      // this holds on real hardware; if it doesn't, this check is simply
+      // never true and every request falls through to the timeout path.
+      if (!connectedClients.has(deviceId)) {
+        return res.status(409).json({ status: 'error', message: `${deviceId} is not currently connected` });
+      }
+
+      const requestId = crypto.randomUUID();
+      const key = `${deviceId}:${requestId}`;
+      const packet = {
+        cmd: 'publish',
+        qos: 1,
+        topic: `kms/${deviceId}/rotate`,
+        payload: Buffer.from(JSON.stringify({ service: 'ssh-host', request_id: requestId })),
+        retain: false
+      };
+
+      const resultPromise = new Promise((resolve, reject) => {
+        const timer = setTimeout(() => {
+          pendingSshHostRenewals.delete(key);
+          reject(new Error('timeout'));
+        }, SSH_HOST_RENEW_TIMEOUT_MS);
+        pendingSshHostRenewals.set(key, { resolve, timer });
+      });
+
+      aedes.publish(packet, function (err) {
+        if (err) {
+          pendingSshHostRenewals.delete(key);
+          console.error(`[ssh-host-renew] 觸發設備 ${deviceId} 憑證更新失敗:`, err);
+          return res.status(500).json({ status: 'error', message: '內部 MQTT 轉發失敗' });
+        }
+        console.log(`[ssh-host-renew] Requested ssh-host renewal for ${deviceId}, request_id=${requestId}`);
+      });
+
+      resultPromise
+        .then((result) => {
+          res.status(200).json(result);
+        })
+        .catch(() => {
+          res.status(504).json({
+            status: 'error',
+            message: `No response from ${deviceId} within ${SSH_HOST_RENEW_TIMEOUT_MS / 1000}s`
+          });
         });
     });
     // ────────────────────────────────────────────────────────────────────────
