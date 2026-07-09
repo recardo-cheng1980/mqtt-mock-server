@@ -32,11 +32,15 @@ async function startMqttServer() {
     // Track connected MQTT clients
     const connectedClients = new Map();
 
-    // Pending /api/ssh-host-renew requests awaiting a correlated
-    // kms/<deviceId>/result message. Keyed by `${deviceId}:${requestId}`,
-    // value { resolve, timer }. See the aedes.on('publish', ...) hook below
-    // and the /api/ssh-host-renew route.
-    const pendingSshHostRenewals = new Map();
+    // Pending wait-for-result requests (currently /api/ssh-host-renew and
+    // /api/ssh-ca-refresh) awaiting a correlated kms/<deviceId>/result
+    // message. Keyed by `${deviceId}:${requestId}`, value
+    // { resolve, timer }. Shared across every such endpoint — the
+    // correlation logic in the aedes.on('publish', ...) hook below only
+    // matches on deviceId/request_id, not which endpoint created the
+    // pending entry, so this is safe to reuse as more endpoints adopt the
+    // same wait-for-result pattern.
+    const pendingDeviceRequests = new Map();
 
     // AVC denial report store — Map<deviceId, MergedState>
     // MergedState: { device_id, first/last_upload_timestamp, last_received_at, upload_count,
@@ -177,10 +181,11 @@ async function startMqttServer() {
         console.log(`收到來自 ${client.id} 的訊息，主題: ${packet.topic}`);
       }
 
-      // Correlate DUT result messages back to a pending /api/ssh-host-renew
-      // request. kms-mqtt-trigger publishes to kms/<deviceId>/result with
-      // whatever JSON kms-cert-manager returned, including the request_id
-      // we sent it (see kms-cert-manager.py's _handle_client echo).
+      // Correlate DUT result messages back to a pending wait-for-result
+      // request (/api/ssh-host-renew, /api/ssh-ca-refresh, ...).
+      // kms-mqtt-trigger publishes to kms/<deviceId>/result with whatever
+      // JSON kms-cert-manager returned, including the request_id we sent
+      // it (see kms-cert-manager.py's _handle_client echo).
       const resultMatch = /^kms\/([^/]+)\/result$/.exec(packet.topic);
       if (resultMatch) {
         const deviceId = resultMatch[1];
@@ -192,10 +197,10 @@ async function startMqttServer() {
         }
         if (payload && payload.request_id) {
           const key = `${deviceId}:${payload.request_id}`;
-          const pending = pendingSshHostRenewals.get(key);
+          const pending = pendingDeviceRequests.get(key);
           if (pending) {
             clearTimeout(pending.timer);
-            pendingSshHostRenewals.delete(key);
+            pendingDeviceRequests.delete(key);
             pending.resolve(payload);
           }
         }
@@ -461,6 +466,11 @@ async function startMqttServer() {
         });
     });
 
+    // Shared timeout for the wait-for-result endpoints below
+    // (/api/ssh-host-renew, /api/ssh-ca-refresh). Vault sign + local file
+    // write is normally sub-second; generous margin for MQTT round-trip.
+    const DEVICE_REQUEST_TIMEOUT_MS = 25000;
+
     // Trigger an SSH host-certificate renewal on a specific device over
     // MQTT, waiting for the DUT's actual result instead of firing and
     // forgetting like /api/rotate. Replaces kms-ssh-host-cert-renew.timer
@@ -468,8 +478,6 @@ async function startMqttServer() {
     // docs/kms/ssh-ca-user-and-host-certs-plan.md. Reuses the same
     // X-SSH-Sign-Key auth as /api/ssh-sign since this changes host-identity
     // trust, a more consequential action than the open /api/rotate.
-    const SSH_HOST_RENEW_TIMEOUT_MS = 25000;
-
     app.post('/api/ssh-host-renew/:deviceId', (req, res) => {
       const apiKey = process.env.SSH_SIGN_API_KEY;
       if (!apiKey) {
@@ -505,15 +513,15 @@ async function startMqttServer() {
 
       const resultPromise = new Promise((resolve, reject) => {
         const timer = setTimeout(() => {
-          pendingSshHostRenewals.delete(key);
+          pendingDeviceRequests.delete(key);
           reject(new Error('timeout'));
-        }, SSH_HOST_RENEW_TIMEOUT_MS);
-        pendingSshHostRenewals.set(key, { resolve, timer });
+        }, DEVICE_REQUEST_TIMEOUT_MS);
+        pendingDeviceRequests.set(key, { resolve, timer });
       });
 
       aedes.publish(packet, function (err) {
         if (err) {
-          pendingSshHostRenewals.delete(key);
+          pendingDeviceRequests.delete(key);
           console.error(`[ssh-host-renew] 觸發設備 ${deviceId} 憑證更新失敗:`, err);
           return res.status(500).json({ status: 'error', message: '內部 MQTT 轉發失敗' });
         }
@@ -527,7 +535,74 @@ async function startMqttServer() {
         .catch(() => {
           res.status(504).json({
             status: 'error',
-            message: `No response from ${deviceId} within ${SSH_HOST_RENEW_TIMEOUT_MS / 1000}s`
+            message: `No response from ${deviceId} within ${DEVICE_REQUEST_TIMEOUT_MS / 1000}s`
+          });
+        });
+    });
+
+    // Trigger an SSH CA trust-anchor refresh (TrustedUserCAKeys +
+    // this device's device-scoped AuthorizedPrincipalsFile entry) on a
+    // specific device over MQTT. Same shape as /api/ssh-host-renew above —
+    // same auth, same wait-for-result correlation, same validation.
+    // Replaces kms-ssh-ca-refresh.timer (removed on the DUT side) as the
+    // only refresh path — see docs/kms/ssh-ca-user-and-host-certs-plan.md.
+    // NOTE: unlike host-cert renewal, if this is never called after a
+    // fresh flash, the device has no trust anchor and no auth_principals
+    // entry at all — cert-based login is impossible until this succeeds
+    // at least once. This is a deliberate, accepted trade-off (see the
+    // doc), not an oversight.
+    app.post('/api/ssh-ca-refresh/:deviceId', (req, res) => {
+      const apiKey = process.env.SSH_SIGN_API_KEY;
+      if (!apiKey) {
+        console.error('[ssh-ca-refresh] SSH_SIGN_API_KEY not configured — refusing all requests (fail closed)');
+        return res.status(503).json({ status: 'error', message: 'ssh-ca-refresh endpoint not configured' });
+      }
+      if (req.get('X-SSH-Sign-Key') !== apiKey) {
+        return res.status(401).json({ status: 'error', message: 'unauthorized' });
+      }
+
+      const deviceId = req.params.deviceId;
+      if (!DEVICE_ID_PATTERN.test(deviceId)) {
+        return res.status(400).json({ status: 'error', message: `Invalid device_id: ${deviceId}` });
+      }
+
+      // No online fast-fail check — same connectedClients-keying mismatch
+      // documented on /api/ssh-host-renew above applies identically here.
+      const requestId = crypto.randomUUID();
+      const key = `${deviceId}:${requestId}`;
+      const packet = {
+        cmd: 'publish',
+        qos: 1,
+        topic: `kms/${deviceId}/rotate`,
+        payload: Buffer.from(JSON.stringify({ service: 'ssh-ca', request_id: requestId })),
+        retain: false
+      };
+
+      const resultPromise = new Promise((resolve, reject) => {
+        const timer = setTimeout(() => {
+          pendingDeviceRequests.delete(key);
+          reject(new Error('timeout'));
+        }, DEVICE_REQUEST_TIMEOUT_MS);
+        pendingDeviceRequests.set(key, { resolve, timer });
+      });
+
+      aedes.publish(packet, function (err) {
+        if (err) {
+          pendingDeviceRequests.delete(key);
+          console.error(`[ssh-ca-refresh] 觸發設備 ${deviceId} CA 更新失敗:`, err);
+          return res.status(500).json({ status: 'error', message: '內部 MQTT 轉發失敗' });
+        }
+        console.log(`[ssh-ca-refresh] Requested ssh-ca refresh for ${deviceId}, request_id=${requestId}`);
+      });
+
+      resultPromise
+        .then((result) => {
+          res.status(200).json(result);
+        })
+        .catch(() => {
+          res.status(504).json({
+            status: 'error',
+            message: `No response from ${deviceId} within ${DEVICE_REQUEST_TIMEOUT_MS / 1000}s`
           });
         });
     });
