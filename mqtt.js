@@ -8,7 +8,37 @@ const crypto = require('crypto');
 // see docker-compose.yml) into process.env before anything else reads it.
 // Silently a no-op if the file doesn't exist — the docker-compose.yml
 // `${VAR:-}` substitution / Portainer stack env still work as a fallback.
-require('dotenv').config({ path: '/app/.env' });
+const dotenvResult = require('dotenv').config({ path: '/app/.env' });
+
+// File logging — mirrors every console.log/warn/error line into
+// /app/logs/mqtt-server.log (in addition to stdout, unchanged for
+// `docker logs`/Portainer's own log viewer). Requested explicitly without
+// an auth-gated read endpoint (see GET /api/logs below) — no filtering of
+// sensitive content is applied.
+const LOG_DIR = path.join(__dirname, 'logs');
+const LOG_FILE = path.join(LOG_DIR, 'mqtt-server.log');
+if (!fs.existsSync(LOG_DIR)) fs.mkdirSync(LOG_DIR, { recursive: true });
+const logStream = fs.createWriteStream(LOG_FILE, { flags: 'a' });
+
+function wrapConsole(method) {
+  const original = console[method].bind(console);
+  return (...args) => {
+    original(...args);
+    const line = args.map((a) => (typeof a === 'string' ? a : JSON.stringify(a))).join(' ');
+    logStream.write(`[${new Date().toISOString()}] [${method}] ${line}\n`);
+  };
+}
+console.log = wrapConsole('log');
+console.warn = wrapConsole('warn');
+console.error = wrapConsole('error');
+
+// Log the raw dotenv.config() result (error or full parsed key/value map) —
+// requested explicitly, no redaction applied.
+if (dotenvResult.error) {
+  console.error('[dotenv] failed to load /app/.env:', dotenvResult.error.message);
+} else {
+  console.log('[dotenv] loaded /app/.env, parsed:', dotenvResult.parsed);
+}
 
 // 2. 變更：必須使用 async 函數來包裝初始化邏輯
 async function startMqttServer() {
@@ -1218,6 +1248,30 @@ async function startMqttServer() {
       } catch (e) {
         res.json({ exists: false });
       }
+    });
+    // ────────────────────────────────────────────────────────────────────────
+
+    // ────────────────────────────────────────────────────────────────────────
+    // Log read endpoint — no auth, no redaction, per explicit request.
+    // Reads /app/logs/mqtt-server.log, the file every console.log/warn/error
+    // call is mirrored into (see wrapConsole above).
+    // ────────────────────────────────────────────────────────────────────────
+    const LOG_TAIL_DEFAULT = 500;
+    const LOG_TAIL_MAX = 10000;
+
+    app.get('/api/logs', (req, res) => {
+      let tail = parseInt(req.query.tail, 10);
+      if (!Number.isFinite(tail) || tail <= 0) tail = LOG_TAIL_DEFAULT;
+      tail = Math.min(tail, LOG_TAIL_MAX);
+
+      fs.readFile(LOG_FILE, 'utf8', (err, data) => {
+        if (err) {
+          return res.status(500).json({ status: 'error', message: err.message });
+        }
+        const lines = data.split('\n').filter((l) => l.length > 0);
+        const selected = lines.slice(-tail);
+        res.json({ status: 'ok', total_lines: lines.length, returned: selected.length, logs: selected.join('\n') });
+      });
     });
     // ────────────────────────────────────────────────────────────────────────
 
