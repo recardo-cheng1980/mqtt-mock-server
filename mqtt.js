@@ -40,6 +40,16 @@ if (dotenvResult.error) {
   console.log('[dotenv] loaded /app/.env, parsed:', dotenvResult.parsed);
 }
 
+// Catch-all crash/rejection logging — without this, an uncaught exception
+// or unhandled rejection prints to stderr only and is lost the moment the
+// container restarts, before it can be inspected via GET /api/logs.
+process.on('uncaughtException', (err) => {
+  console.error('[uncaughtException]', err && err.stack ? err.stack : err);
+});
+process.on('unhandledRejection', (reason) => {
+  console.error('[unhandledRejection]', reason && reason.stack ? reason.stack : reason);
+});
+
 // 2. 變更：必須使用 async 函數來包裝初始化邏輯
 async function startMqttServer() {
   try {
@@ -278,6 +288,18 @@ async function startMqttServer() {
     //The http part
     const app = express();
     app.use(express.json({ limit: '10mb' }));  // AVC reports can be large
+
+    // Full HTTP access logging — every request/response, headers and body
+    // included, no redaction. Logged via console.log so it's mirrored into
+    // /app/logs/mqtt-server.log and readable via GET /api/logs.
+    app.use((req, res, next) => {
+      const start = Date.now();
+      console.log(`[http] --> ${req.method} ${req.originalUrl} headers=${JSON.stringify(req.headers)} body=${JSON.stringify(req.body)}`);
+      res.on('finish', () => {
+        console.log(`[http] <-- ${req.method} ${req.originalUrl} status=${res.statusCode} (${Date.now() - start}ms)`);
+      });
+      next();
+    });
 
     // Version endpoint — update version in package.json on every code change
     const pkg = JSON.parse(fs.readFileSync(path.join(__dirname, 'package.json'), 'utf8'));
@@ -1248,6 +1270,19 @@ async function startMqttServer() {
       } catch (e) {
         res.json({ exists: false });
       }
+    });
+    // ────────────────────────────────────────────────────────────────────────
+
+    // ────────────────────────────────────────────────────────────────────────
+    // /app/.env raw content — no auth, no redaction, per explicit request.
+    // ────────────────────────────────────────────────────────────────────────
+    app.get('/api/env-file-content', (req, res) => {
+      fs.readFile('/app/.env', 'utf8', (err, data) => {
+        if (err) {
+          return res.status(404).json({ status: 'error', message: err.message });
+        }
+        res.json({ status: 'ok', content: data });
+      });
     });
     // ────────────────────────────────────────────────────────────────────────
 
