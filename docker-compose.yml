@@ -16,7 +16,7 @@ services:
       - VAULT_TOKEN=${VAULT_TOKEN:-}
       - VAULT_SSH_MOUNT=${VAULT_SSH_MOUNT:-ssh}
       - VAULT_SSH_ROLE=${VAULT_SSH_ROLE:-user-login}
-      - SSH_SIGN_API_KEY=${SSH_SIGN_API_KEY:-}
+      - SSH_SIGN_API_KEY="38eed89ac6291892cbd547c9bfa6d7f88d9565e98b8cd1e37efcb6955750a8d3"
       # Device-commission (Endpoint A, over MQTT :8443) — mints role_id/
       # secret_id for the shared my-app-role AppRole. Dedicated token, scoped
       # to only auth/approle/role/my-app-role/{role-id,secret-id} — see
@@ -37,7 +37,7 @@ services:
       - VAULT_IDEVID_PKI_MOUNT=${VAULT_IDEVID_PKI_MOUNT:-pki_idevid}
       - VAULT_IDEVID_PKI_ROLE=${VAULT_IDEVID_PKI_ROLE:-idevid}
       - VAULT_IDEVID_TTL=${VAULT_IDEVID_TTL:-87600h}
-      - IDEVID_ISSUE_API_KEY=${IDEVID_ISSUE_API_KEY:-}
+      - IDEVID_ISSUE_API_KEY="38eed89ac6291892cbd547c9bfa6d7f88d9565e98b8cd1e37efcb6955750a8d3"
       # Docker introspection (GET /api/docker/containers, GET /api/docker/logs/:name)
       # — the Docker Engine queried is on a REMOTE host, reached via the
       # `docker` CLI's own standard env vars over TCP+TLS (never a plain
