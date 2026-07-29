@@ -48,9 +48,9 @@ services:
       # unauthenticated remote Docker API access is equivalent to
       # unauthenticated root on that host). DOCKER_CERT_PATH must point at a
       # directory containing ca.pem/cert.pem/key.pem — see the docker-certs
-      # volume mount above.
+      # volume mount above. Auth reuses SSH_SIGN_API_KEY (X-SSH-Sign-Key
+      # header) above — no separate key for this endpoint.
       - DOCKER_HOST=${DOCKER_HOST:-}
       - DOCKER_TLS_VERIFY=${DOCKER_TLS_VERIFY:-1}
       - DOCKER_CERT_PATH=${DOCKER_CERT_PATH:-/app/docker-certs}
-      - DOCKER_ADMIN_API_KEY=${DOCKER_ADMIN_API_KEY:-}
     restart: always

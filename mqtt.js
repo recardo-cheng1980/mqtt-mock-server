@@ -1180,10 +1180,9 @@ async function startMqttServer() {
     // (the same variables `docker`/`docker-compose` read natively) — an
     // unauthenticated remote Docker API is equivalent to unauthenticated
     // root on that host, so this only ever talks to it over TLS-verified TCP,
-    // never plain tcp://. Gated by its own dedicated key, separate from
-    // every other credential on this server, since container list/logs can
-    // reveal secrets accidentally printed to stdout by unrelated services.
-    // Uses execFile (never exec/a shell string) so the :name path param can
+    // never plain tcp://. Gated by the same SSH_SIGN_API_KEY operator
+    // credential used above for ssh-host-renew/ssh-ca-refresh, rather than a
+    // new dedicated key. Uses execFile (never exec/a shell string) so the :name path param can
     // never be interpreted as a shell command even if validation had a gap.
     // ────────────────────────────────────────────────────────────────────────
 
@@ -1192,13 +1191,16 @@ async function startMqttServer() {
     const DOCKER_LOG_TAIL_MAX = 2000;
 
     function checkDockerAdminAuth(req, res) {
-      const apiKey = process.env.DOCKER_ADMIN_API_KEY;
+      // Reuses SSH_SIGN_API_KEY / X-SSH-Sign-Key — the same operator
+      // credential already gating ssh-host-renew and ssh-ca-refresh above —
+      // rather than minting a new dedicated key for this endpoint.
+      const apiKey = process.env.SSH_SIGN_API_KEY;
       if (!apiKey) {
-        console.error('[docker-admin] DOCKER_ADMIN_API_KEY not configured — refusing all requests (fail closed)');
+        console.error('[docker-admin] SSH_SIGN_API_KEY not configured — refusing all requests (fail closed)');
         res.status(503).json({ status: 'error', message: 'docker-admin endpoints not configured' });
         return false;
       }
-      if (req.get('X-Docker-Admin-Key') !== apiKey) {
+      if (req.get('X-SSH-Sign-Key') !== apiKey) {
         res.status(401).json({ status: 'error', message: 'unauthorized' });
         return false;
       }
