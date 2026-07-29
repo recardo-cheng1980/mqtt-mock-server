@@ -3,6 +3,7 @@ const https = require('node:https');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const util = require('util');
 
 // Loads /app/.env (mounted read-only from /etc/app/certs/.env on the host,
 // see docker-compose.yml) into process.env before anything else reads it.
@@ -28,7 +29,15 @@ function wrapConsole(method) {
   const original = console[method].bind(console);
   return (...args) => {
     original(...args);
-    const line = args.map((a) => (typeof a === 'string' ? a : JSON.stringify(a))).join(' ');
+    // JSON.stringify(Error) yields "{}" — its message/stack aren't own
+    // enumerable properties — which was silently dropping every error
+    // detail written to the file. util.inspect handles Error, circular
+    // refs, undefined, etc. correctly.
+    const line = args.map((a) => {
+      if (typeof a === 'string') return a;
+      if (a instanceof Error) return a.stack || a.message;
+      return util.inspect(a, { depth: 5 });
+    }).join(' ');
     logStream.write(`[${new Date().toISOString()}] [${method}] ${line}\n`);
   };
 }
@@ -130,7 +139,7 @@ async function startMqttServer() {
         (disk.denials || []).forEach(d => denialMap.set(denialKey(d), d));
         return { ...disk, denialMap };
       } catch (e) {
-        console.error(`[AVC] Failed to load merged state for ${deviceId}:`, e.message);
+        console.error(`[AVC] Failed to load merged state for ${deviceId}:`, e);
         return null;
       }
     }
@@ -255,6 +264,9 @@ async function startMqttServer() {
         try {
           payload = JSON.parse(packet.payload.toString());
         } catch (e) {
+          // A pending /api/ssh-host-renew or /api/ssh-ca-refresh request
+          // would otherwise just time out with no clue why - log it.
+          console.warn(`[result] unparseable payload on kms/${deviceId}/result:`, packet.payload.toString());
           return;
         }
         if (payload && payload.request_id) {
@@ -601,7 +613,7 @@ async function startMqttServer() {
         qos: 1,
         retain: false
       }, (err) => {
-        if (err) console.error(`[commission] failed to publish result for ${deviceId}:`, err.message);
+        if (err) console.error(`[commission] failed to publish result for ${deviceId}:`, err);
       });
     }
 
@@ -652,7 +664,7 @@ async function startMqttServer() {
         console.log(`[commission] issued role_id/secret_id for device_id=${certDeviceId}`);
         publishCommissionResult(certDeviceId, { role_id, secret_id });
       } catch (err) {
-        console.error(`[commission] Vault mint failed for ${certDeviceId}:`, err.message);
+        console.error(`[commission] Vault mint failed for ${certDeviceId}:`, err);
         publishCommissionResult(certDeviceId, { status: 'error', message: err.message });
       }
     }
@@ -753,7 +765,7 @@ async function startMqttServer() {
           res.json({ status: 'ok', ...result });
         })
         .catch((err) => {
-          console.error('[idevid-issue] Vault sign failed:', err.message);
+          console.error('[idevid-issue] Vault sign failed:', err);
           res.status(502).json({ status: 'error', message: err.message });
         });
     });
@@ -795,7 +807,7 @@ async function startMqttServer() {
           res.json({ status: 'ok', certificate: signedKey });
         })
         .catch((err) => {
-          console.error('[ssh-sign] Vault sign failed:', err.message);
+          console.error('[ssh-sign] Vault sign failed:', err);
           res.status(502).json({ status: 'error', message: err.message });
         });
     });
@@ -1012,7 +1024,7 @@ async function startMqttServer() {
         console.log(`[AVC] ${deviceId}: +${incomingDenials.length} incoming (+${newTypes} new) ` +
                     `→ ${merged.denialMap.size} total unique types (upload #${merged.upload_count})`);
       } catch (e) {
-        console.error('[AVC] Failed to persist merged state:', e.message);
+        console.error('[AVC] Failed to persist merged state:', e);
       }
 
       res.json({
@@ -1110,6 +1122,7 @@ async function startMqttServer() {
         });
         res.json({ total_devices: summary.length, devices: summary });
       } catch (e) {
+        console.error('[AVC] /api/avc-files failed:', e);
         res.status(500).json({ error: e.message });
       }
     });
@@ -1140,6 +1153,7 @@ async function startMqttServer() {
           firmware_version:          data.firmware_version
         });
       } catch (e) {
+        console.error(`[AVC] /api/avc-files/${deviceId} failed:`, e);
         res.status(500).json({ error: e.message });
       }
     });
@@ -1219,7 +1233,7 @@ async function startMqttServer() {
             }
             console.log(`[AVC] download: ${toBackup.length} file(s) moved to backup/${ts}/`);
           } catch (e) {
-            console.error('[AVC] backup after download failed:', e.message);
+            console.error('[AVC] backup after download failed:', e);
           }
         });
 
@@ -1227,66 +1241,9 @@ async function startMqttServer() {
         res.setHeader('Content-Disposition', `attachment; filename="avc-denials-combined-${ts}.json"`);
         res.json(combined);
       } catch (e) {
-        console.error('[AVC] avc-download failed:', e.message);
+        console.error('[AVC] avc-download failed:', e);
         res.status(500).json({ error: e.message });
       }
-    });
-    // ────────────────────────────────────────────────────────────────────────
-
-    // ────────────────────────────────────────────────────────────────────────
-    // Runtime env status — no auth, by design: reports only whether each
-    // known env var is set (boolean), never the value. Safe to leave public
-    // since it reveals nothing usable by an attacker; a values-revealing
-    // version of this must never be exposed without auth (see the plaintext
-    // secret incident this server already had once).
-    // ────────────────────────────────────────────────────────────────────────
-    const ENV_STATUS_KEYS = [
-      'VAULT_ADDR', 'VAULT_TOKEN', 'VAULT_SSH_MOUNT', 'VAULT_SSH_ROLE',
-      'VAULT_COMMISSION_TOKEN', 'VAULT_APPROLE_ROLE', 'IDEVID_CA_ISSUER_CN',
-      'VAULT_IDEVID_PKI_TOKEN', 'VAULT_IDEVID_PKI_MOUNT', 'VAULT_IDEVID_PKI_ROLE',
-      'VAULT_IDEVID_TTL', 'IDEVID_ISSUE_API_KEY', 'SSH_SIGN_API_KEY'
-    ];
-
-    app.get('/api/env-status', (req, res) => {
-      const status = {};
-      for (const key of ENV_STATUS_KEYS) {
-        status[key] = Boolean(process.env[key]);
-      }
-      res.json(status);
-    });
-    // ────────────────────────────────────────────────────────────────────────
-
-    // ────────────────────────────────────────────────────────────────────────
-    // /app/.env file status — no auth, metadata only: reports whether the
-    // mounted file exists plus its size/mtime, never its contents. Lets you
-    // tell "mount is empty/absent" apart from "mount has content but dotenv
-    // isn't picking it up" without exposing anything from the file itself.
-    // ────────────────────────────────────────────────────────────────────────
-    app.get('/api/env-file-status', (req, res) => {
-      const envFilePath = '/app/.env';
-      try {
-        const stat = fs.statSync(envFilePath);
-        res.json({
-          exists: true,
-          size_bytes: stat.size,
-          modified_at: stat.mtime.toISOString()
-        });
-      } catch (e) {
-        res.json({ exists: false });
-      }
-    });
-    // ────────────────────────────────────────────────────────────────────────
-
-    // ────────────────────────────────────────────────────────────────────────
-    // /app/.env raw content — no auth, no redaction, per explicit request.
-    // ────────────────────────────────────────────────────────────────────────
-    app.get('/api/env-file-content', (req, res) => {
-      fs.readFile('/app/.env', 'utf8', (err, data) => {
-        if (err) {
-          return res.status(404).json({ status: 'error', message: err.message });
-        }
-        res.json({ status: 'ok', content: data });
-      });
     });
     // ────────────────────────────────────────────────────────────────────────
 
