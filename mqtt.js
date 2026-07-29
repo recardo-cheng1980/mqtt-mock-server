@@ -1171,6 +1171,29 @@ async function startMqttServer() {
     });
     // ────────────────────────────────────────────────────────────────────────
 
+    // ────────────────────────────────────────────────────────────────────────
+    // Runtime env status — no auth, by design: reports only whether each
+    // known env var is set (boolean), never the value. Safe to leave public
+    // since it reveals nothing usable by an attacker; a values-revealing
+    // version of this must never be exposed without auth (see the plaintext
+    // secret incident this server already had once).
+    // ────────────────────────────────────────────────────────────────────────
+    const ENV_STATUS_KEYS = [
+      'VAULT_ADDR', 'VAULT_TOKEN', 'VAULT_SSH_MOUNT', 'VAULT_SSH_ROLE',
+      'VAULT_COMMISSION_TOKEN', 'VAULT_APPROLE_ROLE', 'IDEVID_CA_ISSUER_CN',
+      'VAULT_IDEVID_PKI_TOKEN', 'VAULT_IDEVID_PKI_MOUNT', 'VAULT_IDEVID_PKI_ROLE',
+      'VAULT_IDEVID_TTL', 'IDEVID_ISSUE_API_KEY', 'SSH_SIGN_API_KEY'
+    ];
+
+    app.get('/api/env-status', (req, res) => {
+      const status = {};
+      for (const key of ENV_STATUS_KEYS) {
+        status[key] = Boolean(process.env[key]);
+      }
+      res.json(status);
+    });
+    // ────────────────────────────────────────────────────────────────────────
+
     // 3. 啟動 HTTP 伺服器 (強烈建議綁定 127.0.0.1 確保僅限本機存取)
     const HTTP_PORT = 3000;
     app.listen(HTTP_PORT, '0.0.0.0', () => {
