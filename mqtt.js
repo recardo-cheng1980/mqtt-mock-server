@@ -14,13 +14,25 @@ async function startMqttServer() {
     // 3. 變更：改用 await Aedes.createBroker() 進行非同步初始化
     const aedes = await Aedes.createBroker();
 
+    // Trust anchors for client certs on this mTLS broker: the existing
+    // operational (LDevID) CA, plus the dedicated IDevID CA (see
+    // docs/kms/provision-server-commission-endpoint-plan.md in uct-iq9075) —
+    // kept as a separate file/CA so IDevID commissioning and operational MQTT
+    // traffic can both terminate here without merging trust domains.
+    const brokerCaCerts = [
+      fs.readFileSync('./certs/intermediate-ca.crt'),
+      fs.readFileSync('./certs/root-ca.crt')
+    ];
+    if (fs.existsSync('./certs/idevid-ca.crt')) {
+      brokerCaCerts.push(fs.readFileSync('./certs/idevid-ca.crt'));
+    } else {
+      console.warn('[commission] ./certs/idevid-ca.crt not found — IDevID commissioning over MQTT will fail mTLS verification until it is provisioned (fetch via `vault read -field=certificate pki_idevid/cert/ca`)');
+    }
+
     const options = {
   	key: fs.readFileSync('./certs/privkey.pem'),
 	cert: fs.readFileSync('./certs/fullchain.pem'),
-	ca: [
-		fs.readFileSync('./certs/intermediate-ca.crt'),
-		fs.readFileSync('./certs/root-ca.crt')
- 	],
+	ca: brokerCaCerts,
       // mTLS 核心設定
       requestCert: true,
       rejectUnauthorized: true
@@ -204,6 +216,22 @@ async function startMqttServer() {
             pending.resolve(payload);
           }
         }
+      }
+
+      // Device-commission (Endpoint A): a device with a freshly-enrolled IDevID
+      // cert requests its real Vault AppRole role_id/secret_id over this same
+      // mTLS broker, rather than a separate HTTP endpoint - see
+      // docs/kms/provision-server-commission-endpoint-plan.md in uct-iq9075.
+      const commissionMatch = /^commission\/([^/]+)\/request$/.exec(packet.topic);
+      if (commissionMatch && client) {
+        const topicDeviceId = commissionMatch[1];
+        let payload = {};
+        try {
+          payload = JSON.parse(packet.payload.toString());
+        } catch (e) {
+          // tolerate empty/non-JSON payload - identity comes from the cert either way
+        }
+        handleCommissionRequest(client, topicDeviceId, payload);
       }
     });
 
@@ -423,6 +451,250 @@ async function startMqttServer() {
     // not Vault. Keep this narrow and update deliberately, not blanket.
     const ALLOWED_PRINCIPAL_ROLES = ['admin'];
     const DEVICE_ID_PATTERN = /^kms-[a-zA-Z0-9]+$/;
+
+    // ────────────────────────────────────────────────────────────────────────
+    // Device-commission (Endpoint A): mints a real Vault AppRole role_id/
+    // secret_id for a device presenting its IDevID cert over this mTLS broker.
+    // See docs/kms/provision-server-commission-endpoint-plan.md in uct-iq9075.
+    // ────────────────────────────────────────────────────────────────────────
+
+    // The IDevID cert's CN/SAN is "<device_id>.commission.csyang.org" - a naming
+    // convention baked in at IDevID issuance time (Endpoint B), not a resolvable
+    // hostname. Parse the device_id back out for cross-checking.
+    const COMMISSION_CN_PATTERN = /^([a-zA-Z0-9-]+)\.commission\.csyang\.org$/;
+
+    function extractDeviceIdFromCommissionCN(cn) {
+      const m = COMMISSION_CN_PATTERN.exec(cn || '');
+      return m ? m[1] : null;
+    }
+
+    // Minimal raw-HTTP Vault client (mirrors vaultSshSign's shape below) — GET
+    // the shared AppRole's role_id, then mint a fresh secret_id scoped (via
+    // metadata, for audit traceability only — Vault has no native per-device
+    // scoping for this shared role) to this specific device_id.
+    function vaultRequest(method, urlPath, body) {
+      return new Promise((resolve, reject) => {
+        const vaultAddr = process.env.VAULT_ADDR;
+        if (!vaultAddr) {
+          return reject(new Error('VAULT_ADDR not configured on this server'));
+        }
+        const bodyStr = body ? JSON.stringify(body) : undefined;
+        const url = new URL(urlPath, vaultAddr);
+        const headers = { 'X-Vault-Token': process.env.VAULT_COMMISSION_TOKEN || '' };
+        if (bodyStr) {
+          headers['Content-Type'] = 'application/json';
+          headers['Content-Length'] = Buffer.byteLength(bodyStr);
+        }
+        const vaultReq = https.request(url, { method, headers }, (vaultRes) => {
+          let data = '';
+          vaultRes.on('data', (chunk) => { data += chunk; });
+          vaultRes.on('end', () => {
+            let parsed;
+            try {
+              parsed = JSON.parse(data);
+            } catch (e) {
+              return reject(new Error(`Vault returned non-JSON response (HTTP ${vaultRes.statusCode}): ${data}`));
+            }
+            if (vaultRes.statusCode !== 200) {
+              const errMsg = (parsed.errors || []).join('; ') || `HTTP ${vaultRes.statusCode}`;
+              return reject(new Error(`Vault request failed: ${errMsg}`));
+            }
+            resolve(parsed);
+          });
+        });
+        vaultReq.on('error', reject);
+        if (bodyStr) vaultReq.write(bodyStr);
+        vaultReq.end();
+      });
+    }
+
+    async function vaultCommission(deviceId) {
+      if (!process.env.VAULT_COMMISSION_TOKEN) {
+        throw new Error('VAULT_COMMISSION_TOKEN not configured on this server');
+      }
+      const role = process.env.VAULT_APPROLE_ROLE || 'my-app-role';
+
+      const roleIdResp = await vaultRequest('GET', `/v1/auth/approle/role/${role}/role-id`);
+      if (!roleIdResp.data || !roleIdResp.data.role_id) {
+        throw new Error(`Unexpected Vault role-id response: ${JSON.stringify(roleIdResp)}`);
+      }
+
+      const secretIdResp = await vaultRequest('POST', `/v1/auth/approle/role/${role}/secret-id`, {
+        metadata: JSON.stringify({
+          commissioned_device_id: deviceId,
+          commissioned_at: new Date().toISOString()
+        })
+      });
+      if (!secretIdResp.data || !secretIdResp.data.secret_id) {
+        throw new Error(`Unexpected Vault secret-id response: ${JSON.stringify(secretIdResp)}`);
+      }
+
+      return { role_id: roleIdResp.data.role_id, secret_id: secretIdResp.data.secret_id };
+    }
+
+    function publishCommissionResult(deviceId, payload) {
+      aedes.publish({
+        topic: `commission/${deviceId}/result`,
+        payload: JSON.stringify(payload),
+        qos: 1,
+        retain: false
+      }, (err) => {
+        if (err) console.error(`[commission] failed to publish result for ${deviceId}:`, err.message);
+      });
+    }
+
+    async function handleCommissionRequest(client, topicDeviceId, payload) {
+      const clientInfo = connectedClients.get(client.id);
+      const certCn = clientInfo && clientInfo.cert ? clientInfo.cert.cn : null;
+      const certDeviceId = extractDeviceIdFromCommissionCN(certCn);
+
+      if (!clientInfo || !clientInfo.tls || !certDeviceId) {
+        console.warn(`[commission] rejected: client ${client.id} has no verified IDevID cert`);
+        return publishCommissionResult(topicDeviceId, { status: 'error', message: 'no verified IDevID client certificate' });
+      }
+
+      // The broker's `ca:` list trusts BOTH the operational CA and the
+      // dedicated IDevID CA (see brokerCaCerts above) — a client cert passes
+      // the TLS handshake if it chains to *either* one; TLS itself doesn't
+      // tell you which. A cert's CN matching the <device_id>.commission.
+      // csyang.org pattern is not proof it was actually issued by the IDevID
+      // CA (an operational cert could coincidentally match the pattern, or
+      // be deliberately crafted to). Only the issuer field distinguishes
+      // them, so gate on it explicitly — fail closed if unconfigured, same
+      // convention as the other secrets on this server.
+      const expectedIssuer = process.env.IDEVID_CA_ISSUER_CN;
+      if (!expectedIssuer) {
+        console.error('[commission] IDEVID_CA_ISSUER_CN not configured — refusing all commission requests (fail closed)');
+        return publishCommissionResult(topicDeviceId, { status: 'error', message: 'commission endpoint not configured' });
+      }
+      if (clientInfo.cert.issuer !== expectedIssuer) {
+        console.warn(`[commission] rejected: client ${client.id} cert issued by "${clientInfo.cert.issuer}", expected IDevID CA "${expectedIssuer}"`);
+        return publishCommissionResult(topicDeviceId, { status: 'error', message: 'certificate not issued by the IDevID CA' });
+      }
+
+      if (!DEVICE_ID_PATTERN.test(certDeviceId)) {
+        console.warn(`[commission] rejected: cert device_id "${certDeviceId}" fails pattern check`);
+        return publishCommissionResult(topicDeviceId, { status: 'error', message: 'invalid device_id in certificate' });
+      }
+      // Cross-check identity from three independent sources: the topic the
+      // device published to, the verified IDevID cert's CN, and the JSON body
+      // — reject on any mismatch rather than silently trusting the least
+      // authenticated one (the body).
+      if (certDeviceId !== topicDeviceId || (payload.device_id && payload.device_id !== certDeviceId)) {
+        console.warn(`[commission] rejected: identity mismatch (cert=${certDeviceId} topic=${topicDeviceId} body=${payload.device_id})`);
+        return publishCommissionResult(topicDeviceId, { status: 'error', message: 'device_id mismatch between cert, topic, and request body' });
+      }
+
+      try {
+        const { role_id, secret_id } = await vaultCommission(certDeviceId);
+        console.log(`[commission] issued role_id/secret_id for device_id=${certDeviceId}`);
+        publishCommissionResult(certDeviceId, { role_id, secret_id });
+      } catch (err) {
+        console.error(`[commission] Vault mint failed for ${certDeviceId}:`, err.message);
+        publishCommissionResult(certDeviceId, { status: 'error', message: err.message });
+      }
+    }
+
+    // ────────────────────────────────────────────────────────────────────────
+    // IDevID issuance (Endpoint B): a human OPERATOR calls this — plain HTTPS,
+    // no mTLS — to sign a CSR (extracted from a DUT after tpm2tss-genkey runs
+    // locally there) against a dedicated Vault PKI mount for IDevID, separate
+    // from the operational pki/sign/gateway mount. Operator manually installs
+    // the returned certificate back onto the DUT at idevid-cert.pem. See
+    // docs/kms/provision-server-commission-endpoint-plan.md in uct-iq9075.
+    // ────────────────────────────────────────────────────────────────────────
+
+    async function vaultIdevidSign(csrPem, deviceId) {
+      if (!process.env.VAULT_IDEVID_PKI_TOKEN) {
+        throw new Error('VAULT_IDEVID_PKI_TOKEN not configured on this server');
+      }
+      const vaultAddr = process.env.VAULT_ADDR;
+      if (!vaultAddr) {
+        throw new Error('VAULT_ADDR not configured on this server');
+      }
+      const mount = process.env.VAULT_IDEVID_PKI_MOUNT || 'pki_idevid';
+      const role = process.env.VAULT_IDEVID_PKI_ROLE || 'idevid';
+      const commonName = `${deviceId}.commission.csyang.org`;
+
+      const body = JSON.stringify({
+        csr: csrPem,
+        common_name: commonName,
+        // IDevID is meant to last the device's lifetime — long TTL, not the
+        // short-lived rotation cadence used for operational (LDevID) certs.
+        ttl: process.env.VAULT_IDEVID_TTL || '87600h'
+      });
+
+      return new Promise((resolve, reject) => {
+        const url = new URL(`/v1/${mount}/sign/${role}`, vaultAddr);
+        const vaultReq = https.request(url, {
+          method: 'POST',
+          headers: {
+            'X-Vault-Token': process.env.VAULT_IDEVID_PKI_TOKEN,
+            'Content-Type': 'application/json',
+            'Content-Length': Buffer.byteLength(body)
+          }
+        }, (vaultRes) => {
+          let data = '';
+          vaultRes.on('data', (chunk) => { data += chunk; });
+          vaultRes.on('end', () => {
+            let parsed;
+            try {
+              parsed = JSON.parse(data);
+            } catch (e) {
+              return reject(new Error(`Vault returned non-JSON response (HTTP ${vaultRes.statusCode}): ${data}`));
+            }
+            if (vaultRes.statusCode !== 200) {
+              const errMsg = (parsed.errors || []).join('; ') || `HTTP ${vaultRes.statusCode}`;
+              return reject(new Error(`Vault IDevID sign failed: ${errMsg}`));
+            }
+            if (!parsed.data || !parsed.data.certificate) {
+              return reject(new Error(`Unexpected Vault response: ${data}`));
+            }
+            resolve({
+              certificate: parsed.data.certificate,
+              ca_chain: parsed.data.ca_chain || [],
+              serial_number: parsed.data.serial_number
+            });
+          });
+        });
+        vaultReq.on('error', reject);
+        vaultReq.write(body);
+        vaultReq.end();
+      });
+    }
+
+    // Dedicated operator credential, separate from SSH_SIGN_API_KEY — this
+    // issues a device's permanent hardware identity, a materially more
+    // consequential action than a short-lived SSH login cert.
+    app.post('/api/idevid-issue/:deviceId', (req, res) => {
+      const apiKey = process.env.IDEVID_ISSUE_API_KEY;
+      if (!apiKey) {
+        console.error('[idevid-issue] IDEVID_ISSUE_API_KEY not configured — refusing all requests (fail closed)');
+        return res.status(503).json({ status: 'error', message: 'idevid-issue endpoint not configured' });
+      }
+      if (req.get('X-IDevID-Issue-Key') !== apiKey) {
+        return res.status(401).json({ status: 'error', message: 'unauthorized' });
+      }
+
+      const { deviceId } = req.params;
+      const { csr } = req.body || {};
+      if (!DEVICE_ID_PATTERN.test(deviceId)) {
+        return res.status(400).json({ status: 'error', message: `Invalid device_id: ${deviceId}` });
+      }
+      if (!csr || !csr.includes('BEGIN CERTIFICATE REQUEST')) {
+        return res.status(400).json({ status: 'error', message: 'Missing or malformed CSR (expected PEM)' });
+      }
+
+      vaultIdevidSign(csr, deviceId)
+        .then((result) => {
+          console.log(`[idevid-issue] Issued IDevID cert for device_id=${deviceId} serial=${result.serial_number}`);
+          res.json({ status: 'ok', ...result });
+        })
+        .catch((err) => {
+          console.error('[idevid-issue] Vault sign failed:', err.message);
+          res.status(502).json({ status: 'error', message: err.message });
+        });
+    });
 
     app.post('/api/ssh-sign', (req, res) => {
       const apiKey = process.env.SSH_SIGN_API_KEY;
