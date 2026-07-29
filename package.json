@@ -1,6 +1,6 @@
 {
   "name": "mqtt-mock-server",
-  "version": "1.15.2",
+  "version": "1.15.3",
   "scripts": {
     "start": "pm2 start mqtt.js --name 'mqtt-mtls-broker' --output ./logs/out.log --error ./logs/error.log --time --merge-logs",
     "stop": "pm2 stop mqtt-mtls-broker",
@@ -9,6 +9,7 @@
   },
   "dependencies": {
     "aedes": "^1.0.1",
+    "dotenv": "^17.4.2",
     "express": "^5.2.1",
     "pm2": "^6.0.14"
   }

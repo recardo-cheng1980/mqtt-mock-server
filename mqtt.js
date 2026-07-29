@@ -4,6 +4,12 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 
+// Loads /app/.env (mounted read-only from /etc/app/certs/.env on the host,
+// see docker-compose.yml) into process.env before anything else reads it.
+// Silently a no-op if the file doesn't exist — the docker-compose.yml
+// `${VAR:-}` substitution / Portainer stack env still work as a fallback.
+require('dotenv').config({ path: '/app/.env' });
+
 // 2. 變更：必須使用 async 函數來包裝初始化邏輯
 async function startMqttServer() {
   try {
