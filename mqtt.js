@@ -6,9 +6,13 @@ const crypto = require('crypto');
 
 // Loads /app/.env (mounted read-only from /etc/app/certs/.env on the host,
 // see docker-compose.yml) into process.env before anything else reads it.
-// Silently a no-op if the file doesn't exist — the docker-compose.yml
-// `${VAR:-}` substitution / Portainer stack env still work as a fallback.
-const dotenvResult = require('dotenv').config({ path: '/app/.env' });
+// override: true is required — docker-compose.yml's `${VAR:-}` substitution
+// pre-sets every one of these keys in process.env (as "" when unset in
+// Portainer), and dotenv's default behavior is to never touch a key that
+// already exists, even if its value is an empty string. Without override,
+// every var with an empty compose default silently never gets the .env
+// file's value. Silently a no-op if the file doesn't exist.
+const dotenvResult = require('dotenv').config({ path: '/app/.env', override: true });
 
 // File logging — mirrors every console.log/warn/error line into
 // /app/logs/mqtt-server.log (in addition to stdout, unchanged for
