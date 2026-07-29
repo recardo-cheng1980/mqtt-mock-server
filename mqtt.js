@@ -458,10 +458,10 @@ async function startMqttServer() {
     // See docs/kms/provision-server-commission-endpoint-plan.md in uct-iq9075.
     // ────────────────────────────────────────────────────────────────────────
 
-    // The IDevID cert's CN/SAN is "<device_id>.commission.csyang.org" - a naming
+    // The IDevID cert's CN/SAN is "<device_id>.provision.csyang.org" - a naming
     // convention baked in at IDevID issuance time (Endpoint B), not a resolvable
     // hostname. Parse the device_id back out for cross-checking.
-    const COMMISSION_CN_PATTERN = /^([a-zA-Z0-9-]+)\.commission\.csyang\.org$/;
+    const COMMISSION_CN_PATTERN = /^([a-zA-Z0-9-]+)\.provision\.csyang\.org$/;
 
     function extractDeviceIdFromCommissionCN(cn) {
       const m = COMMISSION_CN_PATTERN.exec(cn || '');
@@ -614,7 +614,7 @@ async function startMqttServer() {
       }
       const mount = process.env.VAULT_IDEVID_PKI_MOUNT || 'pki_idevid';
       const role = process.env.VAULT_IDEVID_PKI_ROLE || 'idevid';
-      const commonName = `${deviceId}.commission.csyang.org`;
+      const commonName = `${deviceId}.provision.csyang.org`;
 
       const body = JSON.stringify({
         csr: csrPem,
