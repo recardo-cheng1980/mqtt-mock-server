@@ -3,6 +3,7 @@ const https = require('node:https');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const { execFile } = require('child_process');
 
 // 2. 變更：必須使用 async 函數來包裝初始化邏輯
 async function startMqttServer() {
@@ -1168,6 +1169,94 @@ async function startMqttServer() {
         console.error('[AVC] avc-download failed:', e.message);
         res.status(500).json({ error: e.message });
       }
+    });
+    // ────────────────────────────────────────────────────────────────────────
+
+    // ────────────────────────────────────────────────────────────────────────
+    // Docker introspection (list containers / fetch logs by name) — the
+    // Docker Engine being queried is on a REMOTE host, not this container's
+    // own local daemon. Talks to it via the `docker` CLI configured through
+    // the standard DOCKER_HOST/DOCKER_TLS_VERIFY/DOCKER_CERT_PATH env vars
+    // (the same variables `docker`/`docker-compose` read natively) — an
+    // unauthenticated remote Docker API is equivalent to unauthenticated
+    // root on that host, so this only ever talks to it over TLS-verified TCP,
+    // never plain tcp://. Gated by its own dedicated key, separate from
+    // every other credential on this server, since container list/logs can
+    // reveal secrets accidentally printed to stdout by unrelated services.
+    // Uses execFile (never exec/a shell string) so the :name path param can
+    // never be interpreted as a shell command even if validation had a gap.
+    // ────────────────────────────────────────────────────────────────────────
+
+    const DOCKER_NAME_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/;
+    const DOCKER_LOG_TAIL_DEFAULT = 200;
+    const DOCKER_LOG_TAIL_MAX = 2000;
+
+    function checkDockerAdminAuth(req, res) {
+      const apiKey = process.env.DOCKER_ADMIN_API_KEY;
+      if (!apiKey) {
+        console.error('[docker-admin] DOCKER_ADMIN_API_KEY not configured — refusing all requests (fail closed)');
+        res.status(503).json({ status: 'error', message: 'docker-admin endpoints not configured' });
+        return false;
+      }
+      if (req.get('X-Docker-Admin-Key') !== apiKey) {
+        res.status(401).json({ status: 'error', message: 'unauthorized' });
+        return false;
+      }
+      if (!process.env.DOCKER_HOST) {
+        console.error('[docker-admin] DOCKER_HOST not configured — refusing (fail closed, remote engine unreachable without it)');
+        res.status(503).json({ status: 'error', message: 'DOCKER_HOST not configured on this server' });
+        return false;
+      }
+      return true;
+    }
+
+    app.get('/api/docker/containers', (req, res) => {
+      if (!checkDockerAdminAuth(req, res)) return;
+
+      execFile('docker', ['ps', '-a', '--format', '{{json .}}'], { timeout: 15000 }, (err, stdout, stderr) => {
+        if (err) {
+          console.error('[docker-admin] docker ps failed:', stderr || err.message);
+          return res.status(502).json({ status: 'error', message: (stderr || err.message).trim() });
+        }
+        const containers = stdout
+          .split('\n')
+          .filter((line) => line.trim())
+          .map((line) => {
+            try {
+              return JSON.parse(line);
+            } catch (e) {
+              return null;
+            }
+          })
+          .filter(Boolean);
+        res.json({ status: 'ok', total: containers.length, containers });
+      });
+    });
+
+    app.get('/api/docker/logs/:name', (req, res) => {
+      if (!checkDockerAdminAuth(req, res)) return;
+
+      const { name } = req.params;
+      if (!DOCKER_NAME_PATTERN.test(name)) {
+        return res.status(400).json({ status: 'error', message: `Invalid container name: ${name}` });
+      }
+
+      let tail = parseInt(req.query.tail, 10);
+      if (!Number.isFinite(tail) || tail <= 0) tail = DOCKER_LOG_TAIL_DEFAULT;
+      tail = Math.min(tail, DOCKER_LOG_TAIL_MAX);
+
+      execFile(
+        'docker',
+        ['logs', '--tail', String(tail), '--timestamps', name],
+        { timeout: 15000, maxBuffer: 10 * 1024 * 1024 },
+        (err, stdout, stderr) => {
+          if (err) {
+            console.error(`[docker-admin] docker logs ${name} failed:`, stderr || err.message);
+            return res.status(502).json({ status: 'error', message: (stderr || err.message).trim() });
+          }
+          res.json({ status: 'ok', name, tail, logs: stdout });
+        }
+      );
     });
     // ────────────────────────────────────────────────────────────────────────
 

@@ -8,6 +8,10 @@ services:
       - /etc/app/certs:/app/certs:ro
       - /home/ext_recardo_cheng_gmail_com/avc-report:/app/avc-reports
       - /etc/app/certs/.env:/app/.env:ro
+      # Docker client TLS material for reaching the REMOTE Docker Engine
+      # (ca.pem/cert.pem/key.pem) — read-only, only used if DOCKER_HOST etc.
+      # below are actually set.
+      - /etc/app/docker-certs:/app/docker-certs:ro
     environment:
       # /api/ssh-sign — values come from Portainer's stack environment
       # config (or a host-side .env untracked by git), never committed here.
@@ -38,4 +42,15 @@ services:
       - VAULT_IDEVID_PKI_ROLE=${VAULT_IDEVID_PKI_ROLE:-idevid}
       - VAULT_IDEVID_TTL=${VAULT_IDEVID_TTL:-87600h}
       - IDEVID_ISSUE_API_KEY=${IDEVID_ISSUE_API_KEY:-}
+      # Docker introspection (GET /api/docker/containers, GET /api/docker/logs/:name)
+      # — the Docker Engine queried is on a REMOTE host, reached via the
+      # `docker` CLI's own standard env vars (never a plain tcp:// endpoint —
+      # unauthenticated remote Docker API access is equivalent to
+      # unauthenticated root on that host). DOCKER_CERT_PATH must point at a
+      # directory containing ca.pem/cert.pem/key.pem — see the docker-certs
+      # volume mount above.
+      - DOCKER_HOST=${DOCKER_HOST:-}
+      - DOCKER_TLS_VERIFY=${DOCKER_TLS_VERIFY:-1}
+      - DOCKER_CERT_PATH=${DOCKER_CERT_PATH:-/app/docker-certs}
+      - DOCKER_ADMIN_API_KEY=${DOCKER_ADMIN_API_KEY:-}
     restart: always
