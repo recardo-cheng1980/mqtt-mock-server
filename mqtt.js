@@ -1200,6 +1200,27 @@ async function startMqttServer() {
     });
     // ────────────────────────────────────────────────────────────────────────
 
+    // ────────────────────────────────────────────────────────────────────────
+    // /app/.env file status — no auth, metadata only: reports whether the
+    // mounted file exists plus its size/mtime, never its contents. Lets you
+    // tell "mount is empty/absent" apart from "mount has content but dotenv
+    // isn't picking it up" without exposing anything from the file itself.
+    // ────────────────────────────────────────────────────────────────────────
+    app.get('/api/env-file-status', (req, res) => {
+      const envFilePath = '/app/.env';
+      try {
+        const stat = fs.statSync(envFilePath);
+        res.json({
+          exists: true,
+          size_bytes: stat.size,
+          modified_at: stat.mtime.toISOString()
+        });
+      } catch (e) {
+        res.json({ exists: false });
+      }
+    });
+    // ────────────────────────────────────────────────────────────────────────
+
     // 3. 啟動 HTTP 伺服器 (強烈建議綁定 127.0.0.1 確保僅限本機存取)
     const HTTP_PORT = 3000;
     app.listen(HTTP_PORT, '0.0.0.0', () => {
