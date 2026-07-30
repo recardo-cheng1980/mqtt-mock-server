@@ -118,6 +118,29 @@ async function startMqttServer() {
     const server = tls.createServer(options, aedes.handle);
     const PORT = 8443;
 
+    // THE actual missing piece: with rejectUnauthorized:true, Node does its
+    // own server-side client-cert authorization check immediately after the
+    // raw TLS handshake completes, separate from (and in addition to) the
+    // cryptographic handshake itself. A client can complete the crypto
+    // handshake successfully (SSL_connect() returns success) and still get
+    // silently disconnected right after if this check fails - and unlike
+    // aedes's own connectionError/clientError events, this happens at the
+    // Node tls layer BEFORE aedes.handle is ever invoked, so none of the
+    // aedes-level diagnostics added above see it either. This is the only
+    // place that failure is ever actually reported.
+    server.on('tlsClientError', (err, tlsSocket) => {
+      console.error(
+        `[tlsClientError] ${tlsSocket.remoteAddress}:${tlsSocket.remotePort} - ${err.message}`,
+        err
+      );
+    });
+    server.on('secureConnection', (tlsSocket) => {
+      console.log(
+        `[secureConnection] ${tlsSocket.remoteAddress}:${tlsSocket.remotePort} ` +
+        `authorized=${tlsSocket.authorized} authorizationError=${tlsSocket.authorizationError}`
+      );
+    });
+
     // Track connected MQTT clients
     const connectedClients = new Map();
 
