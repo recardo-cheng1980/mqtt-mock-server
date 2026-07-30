@@ -73,6 +73,24 @@ async function startMqttServer() {
     // 3. 變更：改用 await Aedes.createBroker() 進行非同步初始化
     const aedes = await Aedes.createBroker();
 
+    // Diagnostic only - Node's EventEmitter silently drops events with no
+    // listener (unless it's the special 'error' event), so without these,
+    // any protocol-level rejection Aedes makes before assigning a client id
+    // (and thus before the 'client' event below) is invisible - it looks
+    // identical to "nothing happened" in the logs.
+    aedes.on('connectionError', (client, err) => {
+      console.error(`[aedes connectionError] client=${client && client.id}:`, err);
+    });
+    aedes.on('clientError', (client, err) => {
+      console.error(`[aedes clientError] client=${client && client.id}:`, err);
+    });
+    aedes.on('keepaliveTimeout', (client) => {
+      console.warn(`[aedes keepaliveTimeout] client=${client && client.id}`);
+    });
+    aedes.on('connackSent', (packet, client) => {
+      console.log(`[aedes connackSent] client=${client && client.id}:`, packet);
+    });
+
     // Trust anchors for client certs on this mTLS broker: the existing
     // operational (LDevID) CA, plus the dedicated IDevID CA (see
     // docs/kms/provision-server-commission-endpoint-plan.md in uct-iq9075) —
