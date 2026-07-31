@@ -610,16 +610,15 @@ async function startMqttServer() {
     //                                allow_user_certificates=false,
     //                                allowed_domains=csyang.org,
     //                                allow_subdomains=true)
-    //   VAULT_SSH_HOST_TTL           defaults to "87600h" — permanent-
-    //                                identity material, not a short-lived
-    //                                operational cert, same lifetime class
-    //                                as IDevID. NOTE: the "host-cert" role's
-    //                                own max_ttl is 8760h (1 year) — Vault
-    //                                caps the actual issued cert's TTL to
-    //                                that ceiling regardless of what's
-    //                                requested here; the role's max_ttl
-    //                                would need raising to genuinely issue
-    //                                a 10-year cert.
+    //   VAULT_SSH_HOST_TTL           defaults to "8760h" (1 year) — matches
+    //                                the "host-cert" role's own max_ttl
+    //                                (confirmed 2026-07-31: Vault does NOT
+    //                                silently cap an over-limit request —
+    //                                it hard-rejects with "ttl is larger
+    //                                than maximum allowed 31536000". A
+    //                                longer-lived cert needs the role's
+    //                                max_ttl raised first, not just this
+    //                                env var.
     function vaultSshHostIssue(publicKey, deviceId) {
       return new Promise((resolve, reject) => {
         const vaultAddr = process.env.VAULT_ADDR;
@@ -637,7 +636,7 @@ async function startMqttServer() {
           // already uses ("<device_id>.provision.csyang.org") so both
           // identities are recognizable as belonging to the same device.
           valid_principals: `${deviceId}.provision.csyang.org`,
-          ttl: process.env.VAULT_SSH_HOST_TTL || '87600h'
+          ttl: process.env.VAULT_SSH_HOST_TTL || '8760h'
         });
 
         const url = new URL(`/v1/${mount}/sign/${role}`, vaultAddr);
