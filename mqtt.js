@@ -588,37 +588,44 @@ async function startMqttServer() {
     // OpenSSH public key directly — there is no CSR concept for SSH certs.
     //
     // Required env vars (Portainer stack config — never commit real values):
-    //   VAULT_ADDR/VAULT_TOKEN  same as vaultSshSign — the token's Vault
-    //                           policy must additionally permit
-    //                           sign/host-cert (Vault-admin-owned change,
-    //                           same class as the IDevID prerequisites)
-    //   VAULT_SSH_MOUNT         same mount as vaultSshSign above (defaults
-    //                           "ssh") — host and user certs share one mount
-    //   VAULT_SSH_HOST_ROLE     defaults to "host-cert" — a DEDICATED role,
-    //                           distinct from VAULT_SSH_ROLE's "user-login"
-    //                           (confirmed 2026-07-31: Vault rejects
-    //                           cert_type 'host' against the user-login
-    //                           role — "cert_type 'host' is not allowed by
-    //                           role". The real, already-provisioned
-    //                           "host-cert" role has allow_host_certificates
-    //                           =true, allow_user_certificates=false,
-    //                           allowed_domains=csyang.org,
-    //                           allow_subdomains=true)
-    //   VAULT_SSH_HOST_TTL      defaults to "87600h" — permanent-identity
-    //                           material, not a short-lived operational
-    //                           cert, same lifetime class as IDevID.
-    //                           NOTE: the "host-cert" role's own max_ttl is
-    //                           8760h (1 year) — Vault will cap the actual
-    //                           issued cert's TTL to that ceiling regardless
-    //                           of what's requested here; the role's
-    //                           max_ttl would need raising to genuinely
-    //                           issue a 10-year cert.
+    //   VAULT_ADDR                  same Vault server as vaultSshSign
+    //   VAULT_SSH_HOST_CERT_TOKEN   DEDICATED token, distinct from
+    //                                VAULT_TOKEN (2026-07-31: narrower-scoped
+    //                                on purpose — bound only to
+    //                                ssh-host-cert-policy, granting
+    //                                create/update on ssh/sign/host-cert and
+    //                                read on ssh/config/ca; VAULT_TOKEN is
+    //                                not touched by either function below)
+    //   VAULT_SSH_MOUNT              same mount as vaultSshSign above
+    //                                (defaults "ssh") — host and user certs
+    //                                share one mount, different roles/tokens
+    //   VAULT_SSH_HOST_ROLE          defaults to "host-cert" — a DEDICATED
+    //                                role, distinct from VAULT_SSH_ROLE's
+    //                                "user-login" (confirmed 2026-07-31:
+    //                                Vault rejects cert_type 'host' against
+    //                                the user-login role — "cert_type
+    //                                'host' is not allowed by role". The
+    //                                real, already-provisioned "host-cert"
+    //                                role has allow_host_certificates=true,
+    //                                allow_user_certificates=false,
+    //                                allowed_domains=csyang.org,
+    //                                allow_subdomains=true)
+    //   VAULT_SSH_HOST_TTL           defaults to "87600h" — permanent-
+    //                                identity material, not a short-lived
+    //                                operational cert, same lifetime class
+    //                                as IDevID. NOTE: the "host-cert" role's
+    //                                own max_ttl is 8760h (1 year) — Vault
+    //                                caps the actual issued cert's TTL to
+    //                                that ceiling regardless of what's
+    //                                requested here; the role's max_ttl
+    //                                would need raising to genuinely issue
+    //                                a 10-year cert.
     function vaultSshHostIssue(publicKey, deviceId) {
       return new Promise((resolve, reject) => {
         const vaultAddr = process.env.VAULT_ADDR;
-        const vaultToken = process.env.VAULT_TOKEN;
+        const vaultToken = process.env.VAULT_SSH_HOST_CERT_TOKEN;
         if (!vaultAddr || !vaultToken) {
-          return reject(new Error('VAULT_ADDR/VAULT_TOKEN not configured on this server'));
+          return reject(new Error('VAULT_ADDR/VAULT_SSH_HOST_CERT_TOKEN not configured on this server'));
         }
         const mount = process.env.VAULT_SSH_MOUNT || 'ssh';
         const role = process.env.VAULT_SSH_HOST_ROLE || 'host-cert';
@@ -675,7 +682,12 @@ async function startMqttServer() {
     // /var/persist/ssh-trust/client/ca.pub at production-line time. No
     // signing capability is exposed here, matching the removed on-device
     // fetch_ca_public_key()'s "read-only, no signing capability" framing.
-    // See docs/kms/ssh-ca-user-and-host-certs-plan.md in uct-iq9075.
+    // Uses the broader VAULT_TOKEN (same as vaultSshSign), NOT the dedicated
+    // VAULT_SSH_HOST_CERT_TOKEN — that token is scoped to host-cert
+    // ISSUANCE only (2026-07-31, explicit operator decision); VAULT_TOKEN's
+    // policy was separately granted read on ssh/config/ca for this
+    // function. See docs/kms/ssh-ca-user-and-host-certs-plan.md in
+    // uct-iq9075.
     function vaultSshCaPubkey() {
       return new Promise((resolve, reject) => {
         const vaultAddr = process.env.VAULT_ADDR;
