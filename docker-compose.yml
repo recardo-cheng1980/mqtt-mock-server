@@ -44,7 +44,17 @@ services:
       # device. Reuses VAULT_SSH_MOUNT/VAULT_SSH_ROLE above (same mount+role
       # as /api/ssh-sign) rather than a dedicated mount/role — that role's
       # Vault config must permit both cert_type user and host certs. Gated
-      # by the same SSH_SIGN_API_KEY as /api/ssh-sign (no separate key). See
+      # by the same SSH_SIGN_API_KEY as /api/ssh-sign (no separate key).
+      # VAULT_TOKEN's policy must ALSO grant read on ssh/config/ca
+      # (confirmed missing 2026-07-31 — GET /api/ssh-ca-pubkey fails
+      # "permission denied" until this is added; a plain sign/* grant does
+      # not cover the config/ca read path). See
       # docs/kms/ssh-ca-user-and-host-certs-plan.md in uct-iq9075.
       - VAULT_SSH_HOST_TTL=${VAULT_SSH_HOST_TTL:-87600h}
+      # GET /api/logs auth gate — added 2026-07-31 after this endpoint was
+      # found unauthenticated and leaking live Vault tokens/API keys via the
+      # dotenv startup dump + per-request header logging (both now redacted
+      # in code, this is defense in depth, not the only fix). Reuses the
+      # same SSH_SIGN_API_KEY/X-SSH-Sign-Key already declared above rather
+      # than a dedicated variable. Fails closed (503) if unset.
     restart: always

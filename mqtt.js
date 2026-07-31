@@ -45,12 +45,26 @@ console.log = wrapConsole('log');
 console.warn = wrapConsole('warn');
 console.error = wrapConsole('error');
 
-// Log the raw dotenv.config() result (error or full parsed key/value map) —
-// requested explicitly, no redaction applied.
+// Any env var or header name that looks like it carries a credential.
+// Applied to both the startup dotenv dump and every request's headers below
+// — both were leaking live Vault tokens/API keys in plaintext via GET
+// /api/logs until this fix (2026-07-31 incident: confirmed external
+// scanning activity against this server before the leak was caught).
+const SENSITIVE_NAME_PATTERN = /token|key|secret|password|pin|authorization|cookie/i;
+function redactSensitive(obj) {
+  const out = {};
+  for (const [k, v] of Object.entries(obj || {})) {
+    out[k] = SENSITIVE_NAME_PATTERN.test(k) ? (v ? '<redacted>' : '<empty>') : v;
+  }
+  return out;
+}
+
+// Log the dotenv.config() result (error, or parsed key/value map with any
+// credential-shaped value redacted).
 if (dotenvResult.error) {
   console.error('[dotenv] failed to load /app/.env:', dotenvResult.error.message);
 } else {
-  console.log('[dotenv] loaded /app/.env, parsed:', dotenvResult.parsed);
+  console.log('[dotenv] loaded /app/.env, parsed (secrets redacted):', redactSensitive(dotenvResult.parsed));
 }
 
 // Catch-all crash/rejection logging — without this, an uncaught exception
@@ -347,11 +361,12 @@ async function startMqttServer() {
     app.use(express.json({ limit: '10mb' }));  // AVC reports can be large
 
     // Full HTTP access logging — every request/response, headers and body
-    // included, no redaction. Logged via console.log so it's mirrored into
-    // /app/logs/mqtt-server.log and readable via GET /api/logs.
+    // included. Header values are redacted via redactSensitive() (any
+    // X-*-Key/Authorization/Cookie-shaped name) so a signing/issue request's
+    // own auth header never ends up in the log or GET /api/logs.
     app.use((req, res, next) => {
       const start = Date.now();
-      console.log(`[http] --> ${req.method} ${req.originalUrl} headers=${JSON.stringify(req.headers)} body=${JSON.stringify(req.body)}`);
+      console.log(`[http] --> ${req.method} ${req.originalUrl} headers=${JSON.stringify(redactSensitive(req.headers))} body=${JSON.stringify(req.body)}`);
       res.on('finish', () => {
         console.log(`[http] <-- ${req.method} ${req.originalUrl} status=${res.statusCode} (${Date.now() - start}ms)`);
       });
@@ -1406,7 +1421,12 @@ async function startMqttServer() {
     // ────────────────────────────────────────────────────────────────────────
 
     // ────────────────────────────────────────────────────────────────────────
-    // Log read endpoint — no auth, no redaction, per explicit request.
+    // Log read endpoint. Auth-gated (2026-07-31 incident: this was
+    // unauthenticated and, combined with the dotenv/header leaks fixed
+    // above, exposed live Vault tokens/API keys in plaintext to anyone —
+    // confirmed external scanning activity was already occurring). Values
+    // logged going forward are redacted at the source (redactSensitive()),
+    // so this is defense in depth, not the only fix.
     // Reads /app/logs/mqtt-server.log, the file every console.log/warn/error
     // call is mirrored into (see wrapConsole above).
     // ────────────────────────────────────────────────────────────────────────
@@ -1414,6 +1434,18 @@ async function startMqttServer() {
     const LOG_TAIL_MAX = 10000;
 
     app.get('/api/logs', (req, res) => {
+      // Reuses SSH_SIGN_API_KEY/X-SSH-Sign-Key rather than a dedicated
+      // credential — same operator key already gates /api/ssh-sign and
+      // /api/ssh-host-issue above.
+      const apiKey = process.env.SSH_SIGN_API_KEY;
+      if (!apiKey) {
+        console.error('[logs] SSH_SIGN_API_KEY not configured — refusing all requests (fail closed)');
+        return res.status(503).json({ status: 'error', message: 'logs endpoint not configured' });
+      }
+      if (req.get('X-SSH-Sign-Key') !== apiKey) {
+        return res.status(401).json({ status: 'error', message: 'unauthorized' });
+      }
+
       let tail = parseInt(req.query.tail, 10);
       if (!Number.isFinite(tail) || tail <= 0) tail = LOG_TAIL_DEFAULT;
       tail = Math.min(tail, LOG_TAIL_MAX);
