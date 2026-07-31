@@ -144,8 +144,8 @@ async function startMqttServer() {
     // Track connected MQTT clients
     const connectedClients = new Map();
 
-    // Pending wait-for-result requests (currently /api/ssh-host-renew and
-    // /api/ssh-ca-refresh) awaiting a correlated kms/<deviceId>/result
+    // Pending wait-for-result requests (currently /api/ssh-principals-refresh)
+    // awaiting a correlated kms/<deviceId>/result
     // message. Keyed by `${deviceId}:${requestId}`, value
     // { resolve, timer }. Shared across every such endpoint — the
     // correlation logic in the aedes.on('publish', ...) hook below only
@@ -294,7 +294,7 @@ async function startMqttServer() {
       }
 
       // Correlate DUT result messages back to a pending wait-for-result
-      // request (/api/ssh-host-renew, /api/ssh-ca-refresh, ...).
+      // request (/api/ssh-principals-refresh, ...).
       // kms-mqtt-trigger publishes to kms/<deviceId>/result with whatever
       // JSON kms-cert-manager returned, including the request_id we sent
       // it (see kms-cert-manager.py's _handle_client echo).
@@ -305,8 +305,8 @@ async function startMqttServer() {
         try {
           payload = JSON.parse(packet.payload.toString());
         } catch (e) {
-          // A pending /api/ssh-host-renew or /api/ssh-ca-refresh request
-          // would otherwise just time out with no clue why - log it.
+          // A pending /api/ssh-principals-refresh request would otherwise
+          // just time out with no clue why - log it.
           console.warn(`[result] unparseable payload on kms/${deviceId}/result:`, packet.payload.toString());
           return;
         }
@@ -487,7 +487,9 @@ async function startMqttServer() {
     // Required env vars (set via Portainer stack config — never commit
     // real values to this repo):
     //   VAULT_ADDR         e.g. https://vault.csyang.org
-    //   VAULT_TOKEN        token scoped ONLY to ssh/sign/user-login —
+    //   VAULT_TOKEN        token scoped to ssh/sign/user-login on this role
+    //                      (also used by vaultSshHostIssue below for
+    //                      cert_type 'host' against the same mount/role) —
     //                      must NOT be shared with any device's own AppRole
     //   VAULT_SSH_MOUNT    defaults to "ssh"
     //   VAULT_SSH_ROLE     defaults to "user-login"
@@ -554,6 +556,130 @@ async function startMqttServer() {
         });
         vaultReq.on('error', reject);
         vaultReq.write(body);
+        vaultReq.end();
+      });
+    }
+
+    // Operator-driven SSH host-identity issuance (mirrors vaultIdevidSign's
+    // shape, and the same Vault "ssh" mount as vaultSshSign above, but the
+    // "host-cert" role instead of "user-login"). Replaces the old
+    // device-initiated flow (device signed its OWN host key via its own
+    // AppRole, triggered by the now-removed /api/ssh-host-renew) — the host
+    // keypair/cert are now production-line-provisioned, fixed for the
+    // device's lifetime, the same convention as IDevID. See
+    // docs/kms/ssh-ca-user-and-host-certs-plan.md in uct-iq9075.
+    //
+    // Unlike vaultIdevidSign's CSR, Vault's SSH secrets engine signs a raw
+    // OpenSSH public key directly — there is no CSR concept for SSH certs.
+    //
+    // Required env vars (Portainer stack config — never commit real values):
+    //   VAULT_ADDR/VAULT_TOKEN  same as vaultSshSign — the token's Vault
+    //                           policy must additionally permit
+    //                           sign/host-cert (Vault-admin-owned change,
+    //                           same class as the IDevID prerequisites)
+    //   VAULT_SSH_MOUNT/VAULT_SSH_ROLE  same mount+role as vaultSshSign
+    //                           above (defaults "ssh"/"user-login") — this
+    //                           role's Vault config must permit both
+    //                           cert_type user and host certs
+    //   VAULT_SSH_HOST_TTL      defaults to "87600h" — permanent-identity
+    //                           material, not a short-lived operational
+    //                           cert, same lifetime class as IDevID
+    function vaultSshHostIssue(publicKey, deviceId) {
+      return new Promise((resolve, reject) => {
+        const vaultAddr = process.env.VAULT_ADDR;
+        const vaultToken = process.env.VAULT_TOKEN;
+        if (!vaultAddr || !vaultToken) {
+          return reject(new Error('VAULT_ADDR/VAULT_TOKEN not configured on this server'));
+        }
+        const mount = process.env.VAULT_SSH_MOUNT || 'ssh';
+        const role = process.env.VAULT_SSH_ROLE || 'user-login';
+
+        const body = JSON.stringify({
+          public_key: publicKey,
+          cert_type: 'host',
+          // Matches the naming convention device-commission.py's IDevID CN
+          // already uses ("<device_id>.provision.csyang.org") so both
+          // identities are recognizable as belonging to the same device.
+          valid_principals: `${deviceId}.provision.csyang.org`,
+          ttl: process.env.VAULT_SSH_HOST_TTL || '87600h'
+        });
+
+        const url = new URL(`/v1/${mount}/sign/${role}`, vaultAddr);
+        const vaultReq = https.request(url, {
+          method: 'PUT',
+          headers: {
+            'X-Vault-Token': vaultToken,
+            'Content-Type': 'application/json',
+            'Content-Length': Buffer.byteLength(body)
+          }
+        }, (vaultRes) => {
+          let data = '';
+          vaultRes.on('data', (chunk) => { data += chunk; });
+          vaultRes.on('end', () => {
+            let parsed;
+            try {
+              parsed = JSON.parse(data);
+            } catch (e) {
+              return reject(new Error(`Vault returned non-JSON response (HTTP ${vaultRes.statusCode}): ${data}`));
+            }
+            if (vaultRes.statusCode !== 200) {
+              const errMsg = (parsed.errors || []).join('; ') || `HTTP ${vaultRes.statusCode}`;
+              return reject(new Error(`Vault SSH host-cert sign failed: ${errMsg}`));
+            }
+            if (!parsed.data || !parsed.data.signed_key) {
+              return reject(new Error(`Unexpected Vault response: ${data}`));
+            }
+            resolve({
+              certificate: parsed.data.signed_key,
+              serial_number: parsed.data.serial_number
+            });
+          });
+        });
+        vaultReq.on('error', reject);
+        vaultReq.write(body);
+        vaultReq.end();
+      });
+    }
+
+    // Read-only fetch of the SSH CA's public key (Vault "ssh" mount's
+    // config/ca) — used by the operator to install
+    // /var/persist/ssh-trust/client/ca.pub at production-line time. No
+    // signing capability is exposed here, matching the removed on-device
+    // fetch_ca_public_key()'s "read-only, no signing capability" framing.
+    // See docs/kms/ssh-ca-user-and-host-certs-plan.md in uct-iq9075.
+    function vaultSshCaPubkey() {
+      return new Promise((resolve, reject) => {
+        const vaultAddr = process.env.VAULT_ADDR;
+        const vaultToken = process.env.VAULT_TOKEN;
+        if (!vaultAddr || !vaultToken) {
+          return reject(new Error('VAULT_ADDR/VAULT_TOKEN not configured on this server'));
+        }
+        const mount = process.env.VAULT_SSH_MOUNT || 'ssh';
+        const url = new URL(`/v1/${mount}/config/ca`, vaultAddr);
+        const vaultReq = https.request(url, {
+          method: 'GET',
+          headers: { 'X-Vault-Token': vaultToken }
+        }, (vaultRes) => {
+          let data = '';
+          vaultRes.on('data', (chunk) => { data += chunk; });
+          vaultRes.on('end', () => {
+            let parsed;
+            try {
+              parsed = JSON.parse(data);
+            } catch (e) {
+              return reject(new Error(`Vault returned non-JSON response (HTTP ${vaultRes.statusCode}): ${data}`));
+            }
+            if (vaultRes.statusCode !== 200) {
+              const errMsg = (parsed.errors || []).join('; ') || `HTTP ${vaultRes.statusCode}`;
+              return reject(new Error(`Vault CA pubkey fetch failed: ${errMsg}`));
+            }
+            if (!parsed.data || !parsed.data.public_key) {
+              return reject(new Error(`Unexpected Vault response: ${data}`));
+            }
+            resolve(parsed.data.public_key);
+          });
+        });
+        vaultReq.on('error', reject);
         vaultReq.end();
       });
     }
@@ -811,6 +937,57 @@ async function startMqttServer() {
         });
     });
 
+    // Operator-driven SSH host-identity issuance — see vaultSshHostIssue
+    // above and docs/kms/ssh-ca-user-and-host-certs-plan.md in uct-iq9075.
+    // Reuses SSH_SIGN_API_KEY/X-SSH-Sign-Key rather than a dedicated
+    // credential — same operator key already gates /api/ssh-sign below.
+    const PUBLIC_KEY_PATTERN = /^(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp\d+)\s+[A-Za-z0-9+/=]+/;
+    app.post('/api/ssh-host-issue/:deviceId', (req, res) => {
+      const apiKey = process.env.SSH_SIGN_API_KEY;
+      if (!apiKey) {
+        console.error('[ssh-host-issue] SSH_SIGN_API_KEY not configured — refusing all requests (fail closed)');
+        return res.status(503).json({ status: 'error', message: 'ssh-host-issue endpoint not configured' });
+      }
+      if (req.get('X-SSH-Sign-Key') !== apiKey) {
+        return res.status(401).json({ status: 'error', message: 'unauthorized' });
+      }
+
+      const { deviceId } = req.params;
+      const { public_key: publicKey } = req.body || {};
+      if (!DEVICE_ID_PATTERN.test(deviceId)) {
+        return res.status(400).json({ status: 'error', message: `Invalid device_id: ${deviceId}` });
+      }
+      if (!publicKey || !PUBLIC_KEY_PATTERN.test(publicKey.trim())) {
+        return res.status(400).json({ status: 'error', message: 'Missing or malformed public_key (expected OpenSSH pubkey text)' });
+      }
+
+      vaultSshHostIssue(publicKey.trim(), deviceId)
+        .then((result) => {
+          console.log(`[ssh-host-issue] Issued host cert for device_id=${deviceId} serial=${result.serial_number}`);
+          res.json({ status: 'ok', ...result, principal: `admin@${deviceId}` });
+        })
+        .catch((err) => {
+          console.error('[ssh-host-issue] Vault sign failed:', err);
+          res.status(502).json({ status: 'error', message: err.message });
+        });
+    });
+
+    // Read-only, unauthenticated: the SSH CA's public key has no
+    // confidentiality requirement (same reasoning as TrustedUserCAKeys'
+    // removed on-device fetch), matching the existing unauthenticated
+    // /api/clients and /version info endpoints rather than the API-key-
+    // gated signing endpoints above.
+    app.get('/api/ssh-ca-pubkey', (req, res) => {
+      vaultSshCaPubkey()
+        .then((publicKey) => {
+          res.json({ status: 'ok', public_key: publicKey });
+        })
+        .catch((err) => {
+          console.error('[ssh-ca-pubkey] Vault fetch failed:', err);
+          res.status(502).json({ status: 'error', message: err.message });
+        });
+    });
+
     app.post('/api/ssh-sign', (req, res) => {
       const apiKey = process.env.SSH_SIGN_API_KEY;
       if (!apiKey) {
@@ -853,96 +1030,32 @@ async function startMqttServer() {
         });
     });
 
-    // Shared timeout for the wait-for-result endpoints below
-    // (/api/ssh-host-renew, /api/ssh-ca-refresh). Vault sign + local file
-    // write is normally sub-second; generous margin for MQTT round-trip.
+    // Shared timeout for the wait-for-result endpoint below
+    // (/api/ssh-principals-refresh). Vault sign + local file write is
+    // normally sub-second; generous margin for MQTT round-trip.
     const DEVICE_REQUEST_TIMEOUT_MS = 25000;
 
-    // Trigger an SSH host-certificate renewal on a specific device over
-    // MQTT, waiting for the DUT's actual result instead of firing and
-    // forgetting like /api/rotate. Replaces kms-ssh-host-cert-renew.timer
-    // (removed on the DUT side) as the only renewal path — see
-    // docs/kms/ssh-ca-user-and-host-certs-plan.md. Reuses the same
-    // X-SSH-Sign-Key auth as /api/ssh-sign since this changes host-identity
-    // trust, a more consequential action than the open /api/rotate.
-    app.post('/api/ssh-host-renew/:deviceId', (req, res) => {
-      const apiKey = process.env.SSH_SIGN_API_KEY;
-      if (!apiKey) {
-        console.error('[ssh-host-renew] SSH_SIGN_API_KEY not configured — refusing all requests (fail closed)');
-        return res.status(503).json({ status: 'error', message: 'ssh-host-renew endpoint not configured' });
-      }
-      if (req.get('X-SSH-Sign-Key') !== apiKey) {
-        return res.status(401).json({ status: 'error', message: 'unauthorized' });
-      }
-
-      const deviceId = req.params.deviceId;
-      if (!DEVICE_ID_PATTERN.test(deviceId)) {
-        return res.status(400).json({ status: 'error', message: `Invalid device_id: ${deviceId}` });
-      }
-
-      // No online fast-fail check: verified on real hardware that
-      // connectedClients is keyed by kms-mqtt-trigger's MQTT client_id
-      // (`kms-${device_id.slice(0,12)}`, kms-mqtt-trigger.py:596), not the
-      // device_id itself — e.g. device "kms-4077732621" connects as
-      // "kms-kms-40777326". That mapping is lossy (device_id is truncated
-      // to 12 chars, so distinct devices could even collide), so
-      // reconstructing it here would be fragile and misleading. Rely on
-      // the timeout below instead of a broken "is it connected" check.
-      const requestId = crypto.randomUUID();
-      const key = `${deviceId}:${requestId}`;
-      const packet = {
-        cmd: 'publish',
-        qos: 1,
-        topic: `kms/${deviceId}/rotate`,
-        payload: Buffer.from(JSON.stringify({ service: 'ssh-host', request_id: requestId })),
-        retain: false
-      };
-
-      const resultPromise = new Promise((resolve, reject) => {
-        const timer = setTimeout(() => {
-          pendingDeviceRequests.delete(key);
-          reject(new Error('timeout'));
-        }, DEVICE_REQUEST_TIMEOUT_MS);
-        pendingDeviceRequests.set(key, { resolve, timer });
-      });
-
-      aedes.publish(packet, function (err) {
-        if (err) {
-          pendingDeviceRequests.delete(key);
-          console.error(`[ssh-host-renew] 觸發設備 ${deviceId} 憑證更新失敗:`, err);
-          return res.status(500).json({ status: 'error', message: '內部 MQTT 轉發失敗' });
-        }
-        console.log(`[ssh-host-renew] Requested ssh-host renewal for ${deviceId}, request_id=${requestId}`);
-      });
-
-      resultPromise
-        .then((result) => {
-          res.status(200).json(result);
-        })
-        .catch(() => {
-          res.status(504).json({
-            status: 'error',
-            message: `No response from ${deviceId} within ${DEVICE_REQUEST_TIMEOUT_MS / 1000}s`
-          });
-        });
-    });
-
-    // Trigger an SSH CA trust-anchor refresh (TrustedUserCAKeys +
-    // this device's device-scoped AuthorizedPrincipalsFile entry) on a
-    // specific device over MQTT. Same shape as /api/ssh-host-renew above —
-    // same auth, same wait-for-result correlation, same validation.
+    // Trigger a refresh of this device's writable, dynamic auth_principals
+    // entry (/etc/ssh/auth_principals/sysadmin on-device — merged by sshd
+    // with the fixed /var/persist/ssh-trust recovery baseline via
+    // AuthorizedPrincipalsCommand) on a specific device over MQTT.
+    // Renamed from /api/ssh-ca-refresh: the on-device action it triggers
+    // was renamed from "ssh-ca" to "ssh-principals" (it never actually
+    // touched the CA trust anchor — that's production-line-provisioned,
+    // see docs/kms/ssh-ca-user-and-host-certs-plan.md in uct-iq9075).
+    // Keeping the old URL with this new payload would be misleading: the
+    // path would still say "ca" while touching no CA material at all.
     // Replaces kms-ssh-ca-refresh.timer (removed on the DUT side) as the
-    // only refresh path — see docs/kms/ssh-ca-user-and-host-certs-plan.md.
-    // NOTE: unlike host-cert renewal, if this is never called after a
-    // fresh flash, the device has no trust anchor and no auth_principals
-    // entry at all — cert-based login is impossible until this succeeds
-    // at least once. This is a deliberate, accepted trade-off (see the
-    // doc), not an oversight.
-    app.post('/api/ssh-ca-refresh/:deviceId', (req, res) => {
+    // trigger path. NOTE: this does NOT gate cert-based login the way it
+    // used to — the fixed recovery baseline at
+    // /var/persist/ssh-trust/auth_principals already grants access even if
+    // this is never called; this only adds/updates the dynamic, in-field
+    // supplementary principal.
+    app.post('/api/ssh-principals-refresh/:deviceId', (req, res) => {
       const apiKey = process.env.SSH_SIGN_API_KEY;
       if (!apiKey) {
-        console.error('[ssh-ca-refresh] SSH_SIGN_API_KEY not configured — refusing all requests (fail closed)');
-        return res.status(503).json({ status: 'error', message: 'ssh-ca-refresh endpoint not configured' });
+        console.error('[ssh-principals-refresh] SSH_SIGN_API_KEY not configured — refusing all requests (fail closed)');
+        return res.status(503).json({ status: 'error', message: 'ssh-principals-refresh endpoint not configured' });
       }
       if (req.get('X-SSH-Sign-Key') !== apiKey) {
         return res.status(401).json({ status: 'error', message: 'unauthorized' });
@@ -953,15 +1066,19 @@ async function startMqttServer() {
         return res.status(400).json({ status: 'error', message: `Invalid device_id: ${deviceId}` });
       }
 
-      // No online fast-fail check — same connectedClients-keying mismatch
-      // documented on /api/ssh-host-renew above applies identically here.
+      // No online fast-fail check: connectedClients is keyed by
+      // kms-mqtt-trigger's MQTT client_id (`kms-${device_id.slice(0,12)}`),
+      // not the device_id itself — that mapping is lossy (truncated to 12
+      // chars, distinct devices could even collide), so reconstructing it
+      // here would be fragile and misleading. Rely on the timeout below
+      // instead of a broken "is it connected" check.
       const requestId = crypto.randomUUID();
       const key = `${deviceId}:${requestId}`;
       const packet = {
         cmd: 'publish',
         qos: 1,
         topic: `kms/${deviceId}/rotate`,
-        payload: Buffer.from(JSON.stringify({ service: 'ssh-ca', request_id: requestId })),
+        payload: Buffer.from(JSON.stringify({ service: 'ssh-principals', request_id: requestId })),
         retain: false
       };
 
@@ -976,10 +1093,10 @@ async function startMqttServer() {
       aedes.publish(packet, function (err) {
         if (err) {
           pendingDeviceRequests.delete(key);
-          console.error(`[ssh-ca-refresh] 觸發設備 ${deviceId} CA 更新失敗:`, err);
+          console.error(`[ssh-principals-refresh] 觸發設備 ${deviceId} 更新失敗:`, err);
           return res.status(500).json({ status: 'error', message: '內部 MQTT 轉發失敗' });
         }
-        console.log(`[ssh-ca-refresh] Requested ssh-ca refresh for ${deviceId}, request_id=${requestId}`);
+        console.log(`[ssh-principals-refresh] Requested ssh-principals refresh for ${deviceId}, request_id=${requestId}`);
       });
 
       resultPromise

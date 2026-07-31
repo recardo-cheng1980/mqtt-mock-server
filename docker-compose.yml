@@ -38,4 +38,13 @@ services:
       - VAULT_IDEVID_PKI_ROLE=${VAULT_IDEVID_PKI_ROLE:-idevid}
       - VAULT_IDEVID_TTL=${VAULT_IDEVID_TTL:-87600h}
       - IDEVID_ISSUE_API_KEY=${IDEVID_ISSUE_API_KEY:-}
+      # SSH host-identity issuance (POST /api/ssh-host-issue/:deviceId) and
+      # CA pubkey fetch (GET /api/ssh-ca-pubkey) — operator-facing,
+      # production-line provisioning for /var/persist/ssh-trust/ on the
+      # device. Reuses VAULT_SSH_MOUNT/VAULT_SSH_ROLE above (same mount+role
+      # as /api/ssh-sign) rather than a dedicated mount/role — that role's
+      # Vault config must permit both cert_type user and host certs. Gated
+      # by the same SSH_SIGN_API_KEY as /api/ssh-sign (no separate key). See
+      # docs/kms/ssh-ca-user-and-host-certs-plan.md in uct-iq9075.
+      - VAULT_SSH_HOST_TTL=${VAULT_SSH_HOST_TTL:-87600h}
     restart: always
