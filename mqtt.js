@@ -592,13 +592,27 @@ async function startMqttServer() {
     //                           policy must additionally permit
     //                           sign/host-cert (Vault-admin-owned change,
     //                           same class as the IDevID prerequisites)
-    //   VAULT_SSH_MOUNT/VAULT_SSH_ROLE  same mount+role as vaultSshSign
-    //                           above (defaults "ssh"/"user-login") — this
-    //                           role's Vault config must permit both
-    //                           cert_type user and host certs
+    //   VAULT_SSH_MOUNT         same mount as vaultSshSign above (defaults
+    //                           "ssh") — host and user certs share one mount
+    //   VAULT_SSH_HOST_ROLE     defaults to "host-cert" — a DEDICATED role,
+    //                           distinct from VAULT_SSH_ROLE's "user-login"
+    //                           (confirmed 2026-07-31: Vault rejects
+    //                           cert_type 'host' against the user-login
+    //                           role — "cert_type 'host' is not allowed by
+    //                           role". The real, already-provisioned
+    //                           "host-cert" role has allow_host_certificates
+    //                           =true, allow_user_certificates=false,
+    //                           allowed_domains=csyang.org,
+    //                           allow_subdomains=true)
     //   VAULT_SSH_HOST_TTL      defaults to "87600h" — permanent-identity
     //                           material, not a short-lived operational
-    //                           cert, same lifetime class as IDevID
+    //                           cert, same lifetime class as IDevID.
+    //                           NOTE: the "host-cert" role's own max_ttl is
+    //                           8760h (1 year) — Vault will cap the actual
+    //                           issued cert's TTL to that ceiling regardless
+    //                           of what's requested here; the role's
+    //                           max_ttl would need raising to genuinely
+    //                           issue a 10-year cert.
     function vaultSshHostIssue(publicKey, deviceId) {
       return new Promise((resolve, reject) => {
         const vaultAddr = process.env.VAULT_ADDR;
@@ -607,7 +621,7 @@ async function startMqttServer() {
           return reject(new Error('VAULT_ADDR/VAULT_TOKEN not configured on this server'));
         }
         const mount = process.env.VAULT_SSH_MOUNT || 'ssh';
-        const role = process.env.VAULT_SSH_ROLE || 'user-login';
+        const role = process.env.VAULT_SSH_HOST_ROLE || 'host-cert';
 
         const body = JSON.stringify({
           public_key: publicKey,
