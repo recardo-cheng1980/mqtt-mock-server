@@ -538,6 +538,18 @@ async function startMqttServer() {
           valid_principals: principal,
           key_id: engineerId,
           cert_type: 'user',
+          // Without this, Vault issues a cert with an empty Extensions
+          // list, and OpenSSH denies pty/forwarding/etc. by default for
+          // any capability not explicitly granted via a cert extension —
+          // confirmed live 2026-07-31: "Allocating a pty not permitted for
+          // this connection" on every login, even though authentication
+          // itself succeeded. Only requesting what an interactive admin
+          // session actually needs (least privilege) — not forwarding,
+          // agent-forwarding, or X11. Empty string value matches Vault's
+          // SSH secrets engine convention for boolean-style extensions.
+          extensions: {
+            'permit-pty': ''
+          },
           ...(ttl ? { ttl } : {})
         });
 
