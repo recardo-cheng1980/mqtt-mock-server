@@ -4,6 +4,7 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const util = require('util');
+const { buildSshSignAudit, resolveSshSignRequest } = require('./ssh-sign-policy');
 
 // Loads /app/.env (mounted read-only from /etc/app/certs/.env on the host,
 // see docker-compose.yml) into process.env before anything else reads it.
@@ -501,42 +502,38 @@ async function startMqttServer() {
     //
     // Required env vars (set via Portainer stack config — never commit
     // real values to this repo):
-    //   VAULT_ADDR         e.g. https://vault.csyang.org
-    //   VAULT_TOKEN        token scoped to ssh/sign/user-login on this role
-    //                      (also used by vaultSshHostIssue below for
-    //                      cert_type 'host' against the same mount/role) —
-    //                      must NOT be shared with any device's own AppRole
-    //   VAULT_SSH_MOUNT    defaults to "ssh"
-    //   VAULT_SSH_ROLE     defaults to "user-login"
-    //   SSH_SIGN_API_KEY   shared secret required in the X-SSH-Sign-Key
+    //   VAULT_ADDR                 e.g. https://vault.csyang.org
+    //   VAULT_SSH_MOUNT            defaults to "ssh"
+    //   VAULT_SSH_ROLE_*           fixed Vault role per client role
+    //   VAULT_SSH_TOKEN_*           dedicated token per client role
+    //   VAULT_SSH_TTL_*             fixed policy TTL per client role
+    //   SSH_SIGN_API_KEY            shared secret required in the X-SSH-Sign-Key
     //                      header. If unset, this endpoint refuses every
     //                      request (fails closed) rather than silently
     //                      allowing unauthenticated issuance of human login
     //                      credentials — that blast radius is categorically
     //                      different from the other endpoints above.
-    function vaultSshSign(publicKey, principal, engineerId, ttl) {
+    function vaultSshSign(signRequest) {
       return new Promise((resolve, reject) => {
         const vaultAddr = process.env.VAULT_ADDR;
-        const vaultToken = process.env.VAULT_TOKEN;
-        if (!vaultAddr || !vaultToken) {
-          return reject(new Error('VAULT_ADDR/VAULT_TOKEN not configured on this server'));
+        if (!vaultAddr) {
+          return reject(new Error('VAULT_ADDR not configured on this server'));
         }
         const mount = process.env.VAULT_SSH_MOUNT || 'ssh';
-        const role = process.env.VAULT_SSH_ROLE || 'user-login';
 
-        // principal = which local account the cert may log in as (authorization),
-        // already device-scoped ("<role>@<device_id>") by the caller below so
-        // this cert cannot be reused to log into a different device.
-        // engineerId = the actual requesting human, wired through as Vault's
+        // The policy resolver has already derived the target-bound principal,
+        // selected a fixed Vault role/token, and fixed the policy TTL. No value
+        // below is accepted directly from the HTTP request.
+        // engineerId = the requesting human's audit identity, wired through as
         // key_id — deliberately distinct fields. Conflating the two would
         // silently defeat the IEC 62443 SR 6.1 non-repudiation requirement
         // this endpoint exists to satisfy (sshd logs the Key ID on every
         // successful cert login, so this is what makes "who logged in as
         // the shared account, and when" traceable).
         const body = JSON.stringify({
-          public_key: publicKey,
-          valid_principals: principal,
-          key_id: engineerId,
+          public_key: signRequest.publicKey,
+          valid_principals: signRequest.principal,
+          key_id: signRequest.engineerId,
           cert_type: 'user',
           // Without this, Vault issues a cert with an empty Extensions
           // list, and OpenSSH denies pty/forwarding/etc. by default for
@@ -550,14 +547,14 @@ async function startMqttServer() {
           extensions: {
             'permit-pty': ''
           },
-          ...(ttl ? { ttl } : {})
+          ttl: signRequest.ttl
         });
 
-        const url = new URL(`/v1/${mount}/sign/${role}`, vaultAddr);
+        const url = new URL(`/v1/${mount}/sign/${signRequest.vaultRole}`, vaultAddr);
         const vaultReq = https.request(url, {
           method: 'PUT',
           headers: {
-            'X-Vault-Token': vaultToken,
+            'X-Vault-Token': signRequest.vaultToken,
             'Content-Type': 'application/json',
             'Content-Length': Buffer.byteLength(body)
           }
@@ -578,7 +575,12 @@ async function startMqttServer() {
             if (!parsed.data || !parsed.data.signed_key) {
               return reject(new Error(`Unexpected Vault response: ${data}`));
             }
-            resolve(parsed.data.signed_key);
+            resolve({
+              certificate: parsed.data.signed_key,
+              serial_number: parsed.data.serial_number,
+              valid_after: parsed.data.valid_after,
+              valid_before: parsed.data.valid_before
+            });
           });
         });
         vaultReq.on('error', reject);
@@ -608,12 +610,12 @@ async function startMqttServer() {
     //                                create/update on ssh/sign/host-cert and
     //                                read on ssh/config/ca; VAULT_TOKEN is
     //                                not touched by either function below)
-    //   VAULT_SSH_MOUNT              same mount as vaultSshSign above
-    //                                (defaults "ssh") — host and user certs
-    //                                share one mount, different roles/tokens
+    //   VAULT_SSH_MOUNT              same mount as the user-cert signer
+    //                                above (defaults "ssh") — host and user
+    //                                certs share one mount, different roles/tokens
     //   VAULT_SSH_HOST_ROLE          defaults to "host-cert" — a DEDICATED
-    //                                role, distinct from VAULT_SSH_ROLE's
-    //                                "user-login" (confirmed 2026-07-31:
+    //                                role, distinct from every user-login
+    //                                role above (confirmed 2026-07-31:
     //                                Vault rejects cert_type 'host' against
     //                                the user-login role — "cert_type
     //                                'host' is not allowed by role". The
@@ -693,8 +695,9 @@ async function startMqttServer() {
     // /var/persist/ssh-trust/client/ca.pub at production-line time. No
     // signing capability is exposed here, matching the removed on-device
     // fetch_ca_public_key()'s "read-only, no signing capability" framing.
-    // Uses the broader VAULT_TOKEN (same as vaultSshSign), NOT the dedicated
-    // VAULT_SSH_HOST_CERT_TOKEN — that token is scoped to host-cert
+    // Uses the broader VAULT_TOKEN for read-only CA retrieval, NOT any of the
+    // dedicated user-cert signing tokens or VAULT_SSH_HOST_CERT_TOKEN — that
+    // host token is scoped to host-cert
     // ISSUANCE only (2026-07-31, explicit operator decision); VAULT_TOKEN's
     // policy was separately granted read on ssh/config/ca for this
     // function. See docs/kms/ssh-ca-user-and-host-certs-plan.md in
@@ -736,13 +739,6 @@ async function startMqttServer() {
       });
     }
 
-    // Local accounts a cert may claim. Vault's user-login role allows any
-    // username (allowed_users=*) because device-scoped principals
-    // (admin@<device_id>) can't be enumerated per-device in Vault without
-    // manual admin work for every new device — so this allowlist is now
-    // the real enforcement point for "which role names are legitimate",
-    // not Vault. Keep this narrow and update deliberately, not blanket.
-    const ALLOWED_PRINCIPAL_ROLES = ['admin'];
     const DEVICE_ID_PATTERN = /^kms-[a-zA-Z0-9]+$/;
 
     // ────────────────────────────────────────────────────────────────────────
@@ -1050,34 +1046,38 @@ async function startMqttServer() {
         return res.status(401).json({ status: 'error', message: 'unauthorized' });
       }
 
-      const { public_key, principal, device_id, engineer_id, ttl } = req.body || {};
-      if (!public_key || !principal || !device_id || !engineer_id) {
-        return res.status(400).json({
-          status: 'error',
-          message: 'Missing required fields: public_key, principal, device_id, engineer_id'
-        });
-      }
-      if (!ALLOWED_PRINCIPAL_ROLES.includes(principal)) {
-        return res.status(400).json({ status: 'error', message: `Unknown principal role: ${principal}` });
-      }
-      if (!DEVICE_ID_PATTERN.test(device_id)) {
-        return res.status(400).json({ status: 'error', message: `Invalid device_id: ${device_id}` });
+      let signRequest;
+      try {
+        signRequest = resolveSshSignRequest(req.body || {}, process.env);
+      } catch (err) {
+        const statusCode = err.statusCode || 400;
+        if (statusCode >= 500) {
+          console.error('[ssh-sign] request rejected by server configuration:', err.message);
+        }
+        return res.status(statusCode).json({ status: 'error', message: err.message });
       }
 
-      // Device-scoped principal: a cert issued for one device must not be
-      // usable to log into a different device running the same image.
-      // Each device's own /etc/ssh/auth_principals/<account> only lists
-      // its own "<role>@<device_id>" (see kms-cert-manager's
-      // _do_rotate_ssh_ca), so this cert will only match on device_id.
-      const scopedPrincipal = `${principal}@${device_id}`;
-
-      vaultSshSign(public_key, scopedPrincipal, engineer_id, ttl)
-        .then((signedKey) => {
-          console.log(`[ssh-sign] Issued cert for engineer_id=${engineer_id} principal=${scopedPrincipal}`);
-          res.json({ status: 'ok', certificate: signedKey });
+      vaultSshSign(signRequest)
+        .then((signed) => {
+          console.log(buildSshSignAudit(signRequest, signed));
+          const response = {
+            status: 'ok',
+            role: signRequest.role,
+            target: signRequest.target,
+            principal: signRequest.principal,
+            certificate: signed.certificate
+          };
+          if (signed.serial_number !== undefined) response.certificate_serial = signed.serial_number;
+          if (signed.valid_after !== undefined) response.valid_after = signed.valid_after;
+          if (signed.valid_before !== undefined) response.valid_before = signed.valid_before;
+          res.json(response);
         })
         .catch((err) => {
-          console.error('[ssh-sign] Vault sign failed:', err);
+          console.error(
+            `[ssh-sign] Vault sign failed for role=${signRequest.role} ` +
+            `target=${signRequest.target} device_id=${signRequest.deviceId}:`,
+            err
+          );
           res.status(502).json({ status: 'error', message: err.message });
         });
     });

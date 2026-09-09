@@ -15,7 +15,24 @@ services:
       - VAULT_ADDR=${VAULT_ADDR:-}
       - VAULT_TOKEN=${VAULT_TOKEN:-}
       - VAULT_SSH_MOUNT=${VAULT_SSH_MOUNT:-ssh}
-      - VAULT_SSH_ROLE=${VAULT_SSH_ROLE:-user-login}
+      # /api/ssh-sign uses a fixed role and dedicated Vault token for each
+      # target-bound client role. Do not use VAULT_TOKEN for user-cert
+      # issuance; that token remains available to the read-only CA endpoint.
+      - VAULT_SSH_ROLE_HOST_ADMIN=${VAULT_SSH_ROLE_HOST_ADMIN:-}
+      - VAULT_SSH_TOKEN_HOST_ADMIN=${VAULT_SSH_TOKEN_HOST_ADMIN:-}
+      - VAULT_SSH_TTL_HOST_ADMIN=${VAULT_SSH_TTL_HOST_ADMIN:-1440m}
+      - VAULT_SSH_ROLE_OT_ADMIN=${VAULT_SSH_ROLE_OT_ADMIN:-}
+      - VAULT_SSH_TOKEN_OT_ADMIN=${VAULT_SSH_TOKEN_OT_ADMIN:-}
+      - VAULT_SSH_TTL_OT_ADMIN=${VAULT_SSH_TTL_OT_ADMIN:-1440m}
+      - VAULT_SSH_ROLE_OT_OPERATOR=${VAULT_SSH_ROLE_OT_OPERATOR:-}
+      - VAULT_SSH_TOKEN_OT_OPERATOR=${VAULT_SSH_TOKEN_OT_OPERATOR:-}
+      - VAULT_SSH_TTL_OT_OPERATOR=${VAULT_SSH_TTL_OT_OPERATOR:-1440m}
+      # Temporary migration only. Keep false after DUT principals move from
+      # admin@<device_id> to host-admin@<device_id>.
+      - SSH_SIGN_ALLOW_LEGACY_ADMIN=${SSH_SIGN_ALLOW_LEGACY_ADMIN:-false}
+      - VAULT_SSH_ROLE_LEGACY_ADMIN=${VAULT_SSH_ROLE_LEGACY_ADMIN:-}
+      - VAULT_SSH_TOKEN_LEGACY_ADMIN=${VAULT_SSH_TOKEN_LEGACY_ADMIN:-}
+      - VAULT_SSH_TTL_LEGACY_ADMIN=${VAULT_SSH_TTL_LEGACY_ADMIN:-1440m}
       - SSH_SIGN_API_KEY=${SSH_SIGN_API_KEY:-}
       # Device-commission (Endpoint A, over MQTT :8443) — mints role_id/
       # secret_id for the shared my-app-role AppRole. Dedicated token, scoped
