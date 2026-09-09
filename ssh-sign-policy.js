@@ -28,6 +28,27 @@ const ROLE_POLICIES = Object.freeze({
     roleEnv: 'VAULT_SSH_ROLE_OT_OPERATOR',
     tokenEnv: 'VAULT_SSH_TOKEN_OT_OPERATOR',
     ttlEnv: 'VAULT_SSH_TTL_OT_OPERATOR'
+  }),
+  auditor: Object.freeze({
+    target: 'host',
+    principal: 'auditor',
+    roleEnv: 'VAULT_SSH_ROLE_AUDITOR',
+    tokenEnv: 'VAULT_SSH_TOKEN_AUDITOR',
+    ttlEnv: 'VAULT_SSH_TTL_AUDITOR'
+  }),
+  'it-admin': Object.freeze({
+    target: 'itns',
+    principal: 'it-admin',
+    roleEnv: 'VAULT_SSH_ROLE_IT_ADMIN',
+    tokenEnv: 'VAULT_SSH_TOKEN_IT_ADMIN',
+    ttlEnv: 'VAULT_SSH_TTL_IT_ADMIN'
+  }),
+  'dmz-admin': Object.freeze({
+    target: 'dmzns',
+    principal: 'dmz-admin',
+    roleEnv: 'VAULT_SSH_ROLE_DMZ_ADMIN',
+    tokenEnv: 'VAULT_SSH_TOKEN_DMZ_ADMIN',
+    ttlEnv: 'VAULT_SSH_TTL_DMZ_ADMIN'
   })
 });
 
@@ -135,7 +156,10 @@ function resolveSshSignRequest(body, env = process.env) {
       legacy: true
     };
   } else {
-    throw requestError('Missing role (expected host-admin, ot-admin, or ot-operator)', 400);
+    throw requestError(
+      'Missing role (expected host-admin, ot-admin, ot-operator, auditor, it-admin, or dmz-admin)',
+      400
+    );
   }
 
   if (request.target !== undefined && request.target !== target) {
