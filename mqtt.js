@@ -5,6 +5,12 @@ const path = require('path');
 const crypto = require('crypto');
 const util = require('util');
 const { buildSshSignAudit, resolveSshSignRequest } = require('./ssh-sign-policy');
+const {
+  buildPlaneSignAudit,
+  getPlaneCaConfig,
+  resolvePlaneHostIssueRequest,
+  resolvePlaneUserSignRequest
+} = require('./ssh-plane-policy');
 
 // Loads /app/.env (mounted read-only from /etc/app/certs/.env on the host,
 // see docker-compose.yml) into process.env before anything else reads it.
@@ -739,6 +745,104 @@ async function startMqttServer() {
       });
     }
 
+    // Plane-specific SSH CA operations. These are deliberately separate from
+    // the legacy shared-CA functions above: the old endpoints must retain
+    // their current contract and credentials for existing clients.
+    function vaultSshPlaneRequest(method, mount, token, operation, payload) {
+      return new Promise((resolve, reject) => {
+        const vaultAddr = process.env.VAULT_ADDR;
+        if (!vaultAddr) {
+          return reject(new Error('VAULT_ADDR not configured on this server'));
+        }
+        const body = payload === undefined ? undefined : JSON.stringify(payload);
+        const url = new URL(`/v1/${mount}/${operation}`, vaultAddr);
+        const headers = { 'X-Vault-Token': token };
+        if (body !== undefined) {
+          headers['Content-Type'] = 'application/json';
+          headers['Content-Length'] = Buffer.byteLength(body);
+        }
+        const vaultReq = https.request(url, { method, headers }, (vaultRes) => {
+          let data = '';
+          vaultRes.on('data', (chunk) => { data += chunk; });
+          vaultRes.on('end', () => {
+            let parsed;
+            try {
+              parsed = JSON.parse(data);
+            } catch (e) {
+              return reject(new Error(`Vault returned non-JSON response (HTTP ${vaultRes.statusCode}): ${data}`));
+            }
+            if (vaultRes.statusCode !== 200) {
+              const errMsg = (parsed.errors || []).join('; ') || `HTTP ${vaultRes.statusCode}`;
+              return reject(new Error(`Vault SSH request failed: ${errMsg}`));
+            }
+            resolve(parsed);
+          });
+        });
+        vaultReq.on('error', reject);
+        if (body !== undefined) vaultReq.write(body);
+        vaultReq.end();
+      });
+    }
+
+    async function vaultSshPlaneCaPubkey(plane, kind) {
+      const ca = getPlaneCaConfig(plane, kind, process.env);
+      const response = await vaultSshPlaneRequest('GET', ca.mount, ca.token, 'config/ca');
+      if (!response.data || !response.data.public_key) {
+        throw new Error(`Unexpected Vault ${plane}/${kind} CA response`);
+      }
+      return response.data.public_key;
+    }
+
+    async function vaultSshPlaneSign(signRequest) {
+      const response = await vaultSshPlaneRequest(
+        'PUT',
+        signRequest.vaultMount,
+        signRequest.vaultToken,
+        `sign/${signRequest.vaultRole}`,
+        {
+          public_key: signRequest.publicKey,
+          valid_principals: signRequest.principal,
+          key_id: signRequest.engineerId,
+          cert_type: 'user',
+          extensions: { 'permit-pty': '' },
+          ttl: signRequest.ttl
+        }
+      );
+      if (!response.data || !response.data.signed_key) {
+        throw new Error('Unexpected Vault user certificate response');
+      }
+      return {
+        certificate: response.data.signed_key,
+        serial_number: response.data.serial_number,
+        valid_after: response.data.valid_after,
+        valid_before: response.data.valid_before
+      };
+    }
+
+    async function vaultSshPlaneHostIssue(issueRequest) {
+      const response = await vaultSshPlaneRequest(
+        'PUT',
+        issueRequest.vaultMount,
+        issueRequest.vaultToken,
+        `sign/${issueRequest.vaultRole}`,
+        {
+          public_key: issueRequest.publicKey,
+          valid_principals: issueRequest.principal,
+          cert_type: 'host',
+          ttl: issueRequest.ttl
+        }
+      );
+      if (!response.data || !response.data.signed_key) {
+        throw new Error('Unexpected Vault host certificate response');
+      }
+      return {
+        certificate: response.data.signed_key,
+        serial_number: response.data.serial_number,
+        valid_after: response.data.valid_after,
+        valid_before: response.data.valid_before
+      };
+    }
+
     const DEVICE_ID_PATTERN = /^kms-[a-zA-Z0-9]+$/;
 
     // ────────────────────────────────────────────────────────────────────────
@@ -981,6 +1085,151 @@ async function startMqttServer() {
         })
         .catch((err) => {
           console.error('[idevid-issue] Vault sign failed:', err);
+          res.status(502).json({ status: 'error', message: err.message });
+        });
+    });
+
+    // ── Plane-specific SSH CA APIs ──────────────────────────────────────────
+    // These routes are additive. The legacy routes below remain unchanged and
+    // continue to use the original shared SSH CA configuration.
+    app.get('/api/ssh-user-ca-pubkey/:plane', (req, res) => {
+      const { plane } = req.params;
+      Promise.resolve()
+        .then(() => vaultSshPlaneCaPubkey(plane, 'user'))
+        .then((publicKey) => {
+          const ca = getPlaneCaConfig(plane, 'user', process.env);
+          res.json({
+            status: 'ok',
+            kind: 'user',
+            plane,
+            mount: ca.mount,
+            public_key: publicKey
+          });
+        })
+        .catch((err) => {
+          const statusCode = err.statusCode || 502;
+          console.error(`[ssh-plane-ca] ${plane}/user CA fetch failed:`, err.message);
+          res.status(statusCode).json({ status: 'error', message: err.message });
+        });
+    });
+
+    app.get('/api/ssh-host-ca-pubkey/:plane', (req, res) => {
+      const { plane } = req.params;
+      Promise.resolve()
+        .then(() => vaultSshPlaneCaPubkey(plane, 'host'))
+        .then((publicKey) => {
+          const ca = getPlaneCaConfig(plane, 'host', process.env);
+          res.json({
+            status: 'ok',
+            kind: 'host',
+            plane,
+            mount: ca.mount,
+            public_key: publicKey
+          });
+        })
+        .catch((err) => {
+          const statusCode = err.statusCode || 502;
+          console.error(`[ssh-plane-ca] ${plane}/host CA fetch failed:`, err.message);
+          res.status(statusCode).json({ status: 'error', message: err.message });
+        });
+    });
+
+    app.post('/api/ssh-sign/:plane', (req, res) => {
+      const apiKey = process.env.SSH_SIGN_API_KEY;
+      if (!apiKey) {
+        console.error('[ssh-plane-sign] SSH_SIGN_API_KEY not configured — refusing all requests (fail closed)');
+        return res.status(503).json({ status: 'error', message: 'plane ssh-sign endpoint not configured' });
+      }
+      if (req.get('X-SSH-Sign-Key') !== apiKey) {
+        return res.status(401).json({ status: 'error', message: 'unauthorized' });
+      }
+
+      let signRequest;
+      try {
+        signRequest = resolvePlaneUserSignRequest(req.params.plane, req.body || {}, process.env);
+      } catch (err) {
+        const statusCode = err.statusCode || 400;
+        if (statusCode >= 500) {
+          console.error('[ssh-plane-sign] request rejected by server configuration:', err.message);
+        }
+        return res.status(statusCode).json({ status: 'error', message: err.message });
+      }
+
+      vaultSshPlaneSign(signRequest)
+        .then((signed) => {
+          console.log(buildPlaneSignAudit(signRequest, signed));
+          const response = {
+            status: 'ok',
+            kind: 'user',
+            plane: signRequest.plane,
+            role: signRequest.role,
+            target: signRequest.target,
+            principal: signRequest.principal,
+            certificate: signed.certificate
+          };
+          if (signed.serial_number !== undefined) response.certificate_serial = signed.serial_number;
+          if (signed.valid_after !== undefined) response.valid_after = signed.valid_after;
+          if (signed.valid_before !== undefined) response.valid_before = signed.valid_before;
+          res.json(response);
+        })
+        .catch((err) => {
+          console.error(
+            `[ssh-plane-sign] Vault sign failed for plane=${signRequest.plane} ` +
+            `role=${signRequest.role} device_id=${signRequest.deviceId}:`,
+            err
+          );
+          res.status(502).json({ status: 'error', message: err.message });
+        });
+    });
+
+    app.post('/api/ssh-host-issue/:plane/:deviceId', (req, res) => {
+      const apiKey = process.env.SSH_SIGN_API_KEY;
+      if (!apiKey) {
+        console.error('[ssh-plane-host-issue] SSH_SIGN_API_KEY not configured — refusing all requests (fail closed)');
+        return res.status(503).json({ status: 'error', message: 'plane ssh-host-issue endpoint not configured' });
+      }
+      if (req.get('X-SSH-Sign-Key') !== apiKey) {
+        return res.status(401).json({ status: 'error', message: 'unauthorized' });
+      }
+
+      let issueRequest;
+      try {
+        issueRequest = resolvePlaneHostIssueRequest(
+          req.params.plane,
+          req.params.deviceId,
+          req.body || {},
+          process.env
+        );
+      } catch (err) {
+        const statusCode = err.statusCode || 400;
+        if (statusCode >= 500) {
+          console.error('[ssh-plane-host-issue] request rejected by server configuration:', err.message);
+        }
+        return res.status(statusCode).json({ status: 'error', message: err.message });
+      }
+
+      vaultSshPlaneHostIssue(issueRequest)
+        .then((signed) => {
+          console.log(buildPlaneSignAudit(issueRequest, signed));
+          const response = {
+            status: 'ok',
+            kind: 'host',
+            plane: issueRequest.plane,
+            device_id: issueRequest.deviceId,
+            principal: issueRequest.principal,
+            certificate: signed.certificate
+          };
+          if (signed.serial_number !== undefined) response.certificate_serial = signed.serial_number;
+          if (signed.valid_after !== undefined) response.valid_after = signed.valid_after;
+          if (signed.valid_before !== undefined) response.valid_before = signed.valid_before;
+          res.json(response);
+        })
+        .catch((err) => {
+          console.error(
+            `[ssh-plane-host-issue] Vault sign failed for plane=${issueRequest.plane} ` +
+            `device_id=${issueRequest.deviceId}:`,
+            err
+          );
           res.status(502).json({ status: 'error', message: err.message });
         });
     });
