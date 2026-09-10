@@ -7,13 +7,12 @@ const ENGINEER_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._@:/-]{0,127}$/;
 const PUBLIC_KEY_PATTERN = /^(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp(?:256|384|521))\s+[A-Za-z0-9+/]+={0,2}(?:\s[^\r\n]*)?$/;
 const MAX_USER_TTL_MINUTES = 1440;
 const MAX_HOST_TTL_HOURS = 8760;
+const CA_READ_TOKEN_ENV = 'VAULT_SSH_CA_READ_TOKEN';
 
 const PLANE_POLICIES = Object.freeze({
   host: Object.freeze({
     userMountEnv: 'VAULT_SSH_USER_MOUNT_HOST',
-    userCaTokenEnv: 'VAULT_SSH_USER_CA_TOKEN_HOST',
     hostMountEnv: 'VAULT_SSH_HOST_MOUNT_HOST',
-    hostCaTokenEnv: 'VAULT_SSH_HOST_CA_TOKEN_HOST',
     hostRoleEnv: 'VAULT_SSH_HOST_ROLE_HOST',
     hostTokenEnv: 'VAULT_SSH_HOST_TOKEN_HOST',
     hostTtlEnv: 'VAULT_SSH_HOST_TTL_HOST',
@@ -34,9 +33,7 @@ const PLANE_POLICIES = Object.freeze({
   }),
   otns: Object.freeze({
     userMountEnv: 'VAULT_SSH_USER_MOUNT_OTNS',
-    userCaTokenEnv: 'VAULT_SSH_USER_CA_TOKEN_OTNS',
     hostMountEnv: 'VAULT_SSH_HOST_MOUNT_OTNS',
-    hostCaTokenEnv: 'VAULT_SSH_HOST_CA_TOKEN_OTNS',
     hostRoleEnv: 'VAULT_SSH_HOST_ROLE_OTNS',
     hostTokenEnv: 'VAULT_SSH_HOST_TOKEN_OTNS',
     hostTtlEnv: 'VAULT_SSH_HOST_TTL_OTNS',
@@ -57,9 +54,7 @@ const PLANE_POLICIES = Object.freeze({
   }),
   dmzns: Object.freeze({
     userMountEnv: 'VAULT_SSH_USER_MOUNT_DMZNS',
-    userCaTokenEnv: 'VAULT_SSH_USER_CA_TOKEN_DMZNS',
     hostMountEnv: 'VAULT_SSH_HOST_MOUNT_DMZNS',
-    hostCaTokenEnv: 'VAULT_SSH_HOST_CA_TOKEN_DMZNS',
     hostRoleEnv: 'VAULT_SSH_HOST_ROLE_DMZNS',
     hostTokenEnv: 'VAULT_SSH_HOST_TOKEN_DMZNS',
     hostTtlEnv: 'VAULT_SSH_HOST_TTL_DMZNS',
@@ -74,9 +69,7 @@ const PLANE_POLICIES = Object.freeze({
   }),
   itns: Object.freeze({
     userMountEnv: 'VAULT_SSH_USER_MOUNT_ITNS',
-    userCaTokenEnv: 'VAULT_SSH_USER_CA_TOKEN_ITNS',
     hostMountEnv: 'VAULT_SSH_HOST_MOUNT_ITNS',
-    hostCaTokenEnv: 'VAULT_SSH_HOST_CA_TOKEN_ITNS',
     hostRoleEnv: 'VAULT_SSH_HOST_ROLE_ITNS',
     hostTokenEnv: 'VAULT_SSH_HOST_TOKEN_ITNS',
     hostTtlEnv: 'VAULT_SSH_HOST_TTL_ITNS',
@@ -155,15 +148,14 @@ function getPlaneCaConfig(plane, kind, env = process.env) {
   }
 
   const mountEnv = isUser ? policy.userMountEnv : policy.hostMountEnv;
-  const tokenEnv = isUser ? policy.userCaTokenEnv : policy.hostCaTokenEnv;
-  requireConfigured(env, [mountEnv, tokenEnv], `${plane} ${kind} CA retrieval`);
+  requireConfigured(env, [mountEnv, CA_READ_TOKEN_ENV], `${plane} ${kind} CA retrieval`);
   return {
     plane,
     kind,
     mount: env[mountEnv],
-    token: env[tokenEnv],
+    token: env[CA_READ_TOKEN_ENV],
     mountEnv,
-    tokenEnv
+    tokenEnv: CA_READ_TOKEN_ENV
   };
 }
 
