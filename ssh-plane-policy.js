@@ -59,6 +59,35 @@ const PLANE_POLICIES = Object.freeze({
     hostTokenEnv: 'VAULT_SSH_HOST_TOKEN_DMZNS',
     hostTtlEnv: 'VAULT_SSH_HOST_TTL_DMZNS',
     roles: Object.freeze({
+      // The DMZ user CA is the first-hop audience for the Host/OT roles.
+      // Reuse the existing logical-role signing credentials so the server
+      // does not need a second environment-variable family; Vault must grant
+      // each token only its same-role sign path in this mount and its target
+      // mount. The target remains server-derived from the URL plane.
+      'host-admin': Object.freeze({
+        roleEnv: 'VAULT_SSH_USER_ROLE_HOST_ADMIN',
+        tokenEnv: 'VAULT_SSH_USER_TOKEN_HOST_ADMIN',
+        ttlEnv: 'VAULT_SSH_USER_TTL_HOST_ADMIN',
+        principal: 'host-admin'
+      }),
+      auditor: Object.freeze({
+        roleEnv: 'VAULT_SSH_USER_ROLE_AUDITOR',
+        tokenEnv: 'VAULT_SSH_USER_TOKEN_AUDITOR',
+        ttlEnv: 'VAULT_SSH_USER_TTL_AUDITOR',
+        principal: 'auditor'
+      }),
+      'ot-admin': Object.freeze({
+        roleEnv: 'VAULT_SSH_USER_ROLE_OT_ADMIN',
+        tokenEnv: 'VAULT_SSH_USER_TOKEN_OT_ADMIN',
+        ttlEnv: 'VAULT_SSH_USER_TTL_OT_ADMIN',
+        principal: 'ot-admin'
+      }),
+      'ot-operator': Object.freeze({
+        roleEnv: 'VAULT_SSH_USER_ROLE_OT_OPERATOR',
+        tokenEnv: 'VAULT_SSH_USER_TOKEN_OT_OPERATOR',
+        ttlEnv: 'VAULT_SSH_USER_TTL_OT_OPERATOR',
+        principal: 'ot-operator'
+      }),
       'dmz-admin': Object.freeze({
         roleEnv: 'VAULT_SSH_USER_ROLE_DMZ_ADMIN',
         tokenEnv: 'VAULT_SSH_USER_TOKEN_DMZ_ADMIN',
@@ -184,7 +213,11 @@ function resolvePlaneUserSignRequest(plane, body, env = process.env) {
   rejectCallerControlled(['principal', 'target', 'ttl', 'vault_role', 'vault_mount'], request);
 
   const rolePolicy = policy.roles[request.role];
-  requireConfigured(env, [rolePolicy.roleEnv, rolePolicy.tokenEnv], `${plane}/${request.role} signing`);
+  requireConfigured(
+    env,
+    [policy.userMountEnv, rolePolicy.roleEnv, rolePolicy.tokenEnv],
+    `${plane}/${request.role} signing`
+  );
   const ttl = validateUserTtl(env[rolePolicy.ttlEnv] || '1440m', `${plane}/${request.role}`);
 
   return {
@@ -213,7 +246,11 @@ function resolvePlaneHostIssueRequest(plane, deviceId, body, env = process.env) 
     throw requestError(`Invalid device_id: ${deviceId || ''}`, 400);
   }
   rejectCallerControlled(['principal', 'target', 'ttl', 'vault_role', 'vault_mount', 'cert_type'], request);
-  requireConfigured(env, [policy.hostRoleEnv, policy.hostTokenEnv], `${plane} host signing`);
+  requireConfigured(
+    env,
+    [policy.hostMountEnv, policy.hostRoleEnv, policy.hostTokenEnv],
+    `${plane} host signing`
+  );
 
   const ttl = validateHostTtl(env[policy.hostTtlEnv] || '8760h', plane);
   const principal = `${deviceId}.${plane}.provision.csyang.org`;
