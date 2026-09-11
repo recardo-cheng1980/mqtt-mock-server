@@ -2,7 +2,11 @@
 
 const crypto = require('node:crypto');
 
-const DEVICE_ID_PATTERN = /^kms-[a-zA-Z0-9]+$/;
+// New plane-specific certificates are bound to the decimal SoC serial.  Keep
+// the legacy endpoint's looser validation in mqtt.js for compatibility, but do
+// not let the new provisioning flow issue a plane certificate for a synthetic
+// or machine-id-derived identity.
+const DEVICE_ID_PATTERN = /^kms-[0-9]+$/;
 const ENGINEER_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._@:/-]{0,127}$/;
 const PUBLIC_KEY_PATTERN = /^(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp(?:256|384|521))\s+[A-Za-z0-9+/]+={0,2}(?:\s[^\r\n]*)?$/;
 const MAX_USER_TTL_MINUTES = 1440;
@@ -253,7 +257,7 @@ function resolvePlaneHostIssueRequest(plane, deviceId, body, env = process.env) 
   );
 
   const ttl = validateHostTtl(env[policy.hostTtlEnv] || '8760h', plane);
-  const principal = `${deviceId}.${plane}.provision.csyang.org`;
+  const principal = `${deviceId}.${plane}`;
   return {
     plane,
     kind: 'host',
