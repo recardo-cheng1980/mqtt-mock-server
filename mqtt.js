@@ -804,7 +804,7 @@ async function startMqttServer() {
           valid_principals: signRequest.principal,
           key_id: signRequest.engineerId,
           cert_type: 'user',
-          extensions: { 'permit-pty': '' },
+          extensions: signRequest.extensions,
           ttl: signRequest.ttl
         }
       );

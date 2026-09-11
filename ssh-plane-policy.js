@@ -72,25 +72,29 @@ const PLANE_POLICIES = Object.freeze({
         roleEnv: 'VAULT_SSH_USER_ROLE_HOST_ADMIN',
         tokenEnv: 'VAULT_SSH_USER_TOKEN_HOST_ADMIN',
         ttlEnv: 'VAULT_SSH_USER_TTL_HOST_ADMIN',
-        principal: 'host-admin'
+        principal: 'host-admin',
+        permitAgentForwarding: true
       }),
       auditor: Object.freeze({
         roleEnv: 'VAULT_SSH_USER_ROLE_AUDITOR',
         tokenEnv: 'VAULT_SSH_USER_TOKEN_AUDITOR',
         ttlEnv: 'VAULT_SSH_USER_TTL_AUDITOR',
-        principal: 'auditor'
+        principal: 'auditor',
+        permitAgentForwarding: true
       }),
       'ot-admin': Object.freeze({
         roleEnv: 'VAULT_SSH_USER_ROLE_OT_ADMIN',
         tokenEnv: 'VAULT_SSH_USER_TOKEN_OT_ADMIN',
         ttlEnv: 'VAULT_SSH_USER_TTL_OT_ADMIN',
-        principal: 'ot-admin'
+        principal: 'ot-admin',
+        permitAgentForwarding: true
       }),
       'ot-operator': Object.freeze({
         roleEnv: 'VAULT_SSH_USER_ROLE_OT_OPERATOR',
         tokenEnv: 'VAULT_SSH_USER_TOKEN_OT_OPERATOR',
         ttlEnv: 'VAULT_SSH_USER_TTL_OT_OPERATOR',
-        principal: 'ot-operator'
+        principal: 'ot-operator',
+        permitAgentForwarding: true
       }),
       'dmz-admin': Object.freeze({
         roleEnv: 'VAULT_SSH_USER_ROLE_DMZ_ADMIN',
@@ -214,7 +218,7 @@ function resolvePlaneUserSignRequest(plane, body, env = process.env) {
   if (!request.engineer_id || !ENGINEER_ID_PATTERN.test(request.engineer_id)) {
     throw requestError('Missing or malformed engineer_id', 400);
   }
-  rejectCallerControlled(['principal', 'target', 'ttl', 'vault_role', 'vault_mount'], request);
+  rejectCallerControlled(['principal', 'target', 'ttl', 'vault_role', 'vault_mount', 'extensions'], request);
 
   const rolePolicy = policy.roles[request.role];
   requireConfigured(
@@ -237,7 +241,10 @@ function resolvePlaneUserSignRequest(plane, body, env = process.env) {
     vaultMount: env[policy.userMountEnv],
     vaultRole: env[rolePolicy.roleEnv],
     vaultToken: env[rolePolicy.tokenEnv],
-    ttl
+    ttl,
+    extensions: rolePolicy.permitAgentForwarding
+      ? Object.freeze({ 'permit-pty': '', 'permit-agent-forwarding': '' })
+      : Object.freeze({ 'permit-pty': '' })
   };
 }
 
