@@ -73,28 +73,24 @@ const PLANE_POLICIES = Object.freeze({
         tokenEnv: 'VAULT_SSH_USER_TOKEN_HOST_ADMIN',
         ttlEnv: 'VAULT_SSH_USER_TTL_HOST_ADMIN',
         principal: 'host-admin',
-        permitAgentForwarding: true
       }),
       auditor: Object.freeze({
         roleEnv: 'VAULT_SSH_USER_ROLE_AUDITOR',
         tokenEnv: 'VAULT_SSH_USER_TOKEN_AUDITOR',
         ttlEnv: 'VAULT_SSH_USER_TTL_AUDITOR',
         principal: 'auditor',
-        permitAgentForwarding: true
       }),
       'ot-admin': Object.freeze({
         roleEnv: 'VAULT_SSH_USER_ROLE_OT_ADMIN',
         tokenEnv: 'VAULT_SSH_USER_TOKEN_OT_ADMIN',
         ttlEnv: 'VAULT_SSH_USER_TTL_OT_ADMIN',
         principal: 'ot-admin',
-        permitAgentForwarding: true
       }),
       'ot-operator': Object.freeze({
         roleEnv: 'VAULT_SSH_USER_ROLE_OT_OPERATOR',
         tokenEnv: 'VAULT_SSH_USER_TOKEN_OT_OPERATOR',
         ttlEnv: 'VAULT_SSH_USER_TTL_OT_OPERATOR',
         principal: 'ot-operator',
-        permitAgentForwarding: true
       }),
       'dmz-admin': Object.freeze({
         roleEnv: 'VAULT_SSH_USER_ROLE_DMZ_ADMIN',
@@ -242,9 +238,10 @@ function resolvePlaneUserSignRequest(plane, body, env = process.env) {
     vaultRole: env[rolePolicy.roleEnv],
     vaultToken: env[rolePolicy.tokenEnv],
     ttl,
-    extensions: rolePolicy.permitAgentForwarding
-      ? Object.freeze({ 'permit-pty': '', 'permit-agent-forwarding': '' })
-      : Object.freeze({ 'permit-pty': '' })
+    // DMZ transit certificates are pty-only.  The approved second-hop model
+    // imports a separate target key/certificate into /run/user/<uid> on DMZ,
+    // so no workstation agent capability is delegated to the transit zone.
+    extensions: Object.freeze({ 'permit-pty': '' })
   };
 }
 
