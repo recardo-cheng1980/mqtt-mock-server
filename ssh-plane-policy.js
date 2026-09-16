@@ -10,6 +10,7 @@ const DEVICE_ID_PATTERN = /^kms-[0-9]+$/;
 const ENGINEER_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._@:/-]{0,127}$/;
 const PUBLIC_KEY_PATTERN = /^(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp(?:256|384|521))\s+[A-Za-z0-9+/]+={0,2}(?:\s[^\r\n]*)?$/;
 const MAX_USER_TTL_MINUTES = 1440;
+const LOGIN_ACCOUNT_PATTERN = /^[a-z][a-z0-9_-]{0,31}$/;
 const MAX_HOST_TTL_HOURS = 8760;
 const CA_READ_TOKEN_ENV = 'VAULT_SSH_CA_READ_TOKEN';
 
@@ -214,6 +215,17 @@ function resolvePlaneUserSignRequest(plane, body, env = process.env) {
   if (!request.engineer_id || !ENGINEER_ID_PATTERN.test(request.engineer_id)) {
     throw requestError('Missing or malformed engineer_id', 400);
   }
+  if (Object.prototype.hasOwnProperty.call(request, 'login_account')) {
+    if (plane !== 'host' || !['host-admin', 'auditor'].includes(request.role)) {
+      throw requestError('login_account is allowed only for Host host-admin or auditor certificates', 400);
+    }
+    if (!LOGIN_ACCOUNT_PATTERN.test(request.login_account)) {
+      throw requestError('Missing or malformed login_account', 400);
+    }
+    if (request.engineer_id !== request.login_account) {
+      throw requestError('engineer_id must match login_account for account-bound Host certificates', 400);
+    }
+  }
   rejectCallerControlled(['principal', 'target', 'ttl', 'vault_role', 'vault_mount', 'extensions'], request);
 
   const rolePolicy = policy.roles[request.role];
@@ -229,7 +241,9 @@ function resolvePlaneUserSignRequest(plane, body, env = process.env) {
     kind: 'user',
     role: request.role,
     target: plane,
-    principal: `${rolePolicy.principal}@${request.device_id}`,
+    principal: request.login_account
+      ? `${rolePolicy.principal}:${request.login_account}@${request.device_id}`
+      : `${rolePolicy.principal}@${request.device_id}`,
     deviceId: request.device_id,
     engineerId: request.engineer_id,
     publicKey,
