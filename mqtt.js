@@ -1034,15 +1034,15 @@ async function startMqttServer() {
       }
     }
 
-    // Additive operator API for server-initiated commissioning.  Do not reuse
-    // the IDevID-issuance key: creating a remote commissioning command is a
-    // distinct, auditable authority.  All three endpoints fail closed until
-    // the deployment provides COMMISSION_COMMAND_API_KEY.
+    // Additive operator API for server-initiated commissioning.  It shares
+    // the manufacturing IDevID-issuance operator credential by explicit
+    // deployment policy. All three endpoints fail closed until that existing
+    // credential is configured.
     function commissionApiAuthorized(req, res) {
-      const expected = process.env.COMMISSION_COMMAND_API_KEY;
+      const expected = process.env.IDEVID_ISSUE_API_KEY;
       const supplied = req.get('X-Commission-Command-Key') || '';
       if (!expected) {
-        res.status(503).json({ status: 'error', message: 'commission command API not configured' });
+        res.status(503).json({ status: 'error', message: 'IDEVID issuance API not configured' });
         return false;
       }
       const expectedBuf = Buffer.from(expected);

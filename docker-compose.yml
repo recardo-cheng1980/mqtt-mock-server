@@ -108,9 +108,8 @@ services:
       - VAULT_IDEVID_PKI_ROLE=${VAULT_IDEVID_PKI_ROLE:-idevid}
       - VAULT_IDEVID_TTL=${VAULT_IDEVID_TTL:-87600h}
       - IDEVID_ISSUE_API_KEY=${IDEVID_ISSUE_API_KEY:-}
-      # Server-initiated commissioning command/status API. This operator
-      # credential is intentionally separate from IDevID issuance and SSH.
-      - COMMISSION_COMMAND_API_KEY=${COMMISSION_COMMAND_API_KEY:-}
+      # Server-initiated commissioning command/status API intentionally uses
+      # IDEVID_ISSUE_API_KEY above (operator-approved shared credential).
       - COMMISSION_STATE_DIR=/app/commission-state
       # SSH host-identity issuance (POST /api/ssh-host-issue/:deviceId) —
       # operator-facing, production-line provisioning of
