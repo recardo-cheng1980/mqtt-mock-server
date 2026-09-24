@@ -393,7 +393,9 @@ async function startMqttServer() {
         const certDeviceId = extractDeviceIdFromCommissionCN(clientInfo && clientInfo.cert && clientInfo.cert.cn);
         const command = payload && commissionCommands.get(payload.command_id);
         const allowed = new Set(['accepted', 'running', 'succeeded', 'failed', 'already_commissioned']);
+        const expectedIssuer = process.env.IDEVID_CA_ISSUER_CN;
         if (!clientInfo || !clientInfo.tls || certDeviceId !== commandStatusMatch[1] || !command ||
+            !expectedIssuer || clientInfo.cert.issuer !== expectedIssuer ||
             command.device_id !== certDeviceId || !allowed.has(payload.state)) {
           console.warn('[commission-command] rejected invalid command status');
           return;
@@ -1070,6 +1072,10 @@ async function startMqttServer() {
       };
       commissionCommands.set(command.command_id, command);
       saveCommissionCommands();
+      // Persist the pre-delivery state before publishing. A fast DUT can send
+      // `accepted` while Aedes completes this publish callback; writing
+      // `published` in that callback would otherwise regress its newer state.
+      command.state = 'published'; command.updated_at = new Date().toISOString(); saveCommissionCommands();
       const packet = { topic: `commission/${deviceId}/command`, qos: 1, retain: false,
         payload: Buffer.from(JSON.stringify({ version: 1, command_id: command.command_id, operation: 'commission', expires_at: command.expires_at })) };
       aedes.publish(packet, (err) => {
@@ -1077,7 +1083,6 @@ async function startMqttServer() {
           command.state = 'failed'; command.error_code = 'mqtt_publish_failed'; command.updated_at = new Date().toISOString(); saveCommissionCommands();
           return res.status(502).json(commandView(command));
         }
-        command.state = 'published'; command.updated_at = new Date().toISOString(); saveCommissionCommands();
         return res.status(202).json(commandView(command));
       });
     });
