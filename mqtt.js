@@ -181,6 +181,31 @@ async function startMqttServer() {
     const avcStore = new Map();
     const MERGED_FILENAME = 'avc-denials.json';
 
+    // Server-initiated commissioning commands are durable state.  They carry
+    // no Vault material: the legacy IDevID-authenticated request/result flow
+    // remains responsible for that exchange after the DUT accepts a command.
+    const COMMISSION_STATE_DIR = process.env.COMMISSION_STATE_DIR || path.join(__dirname, 'commission-state');
+    const COMMISSION_STATE_FILE = path.join(COMMISSION_STATE_DIR, 'commands.json');
+    if (!fs.existsSync(COMMISSION_STATE_DIR)) fs.mkdirSync(COMMISSION_STATE_DIR, { recursive: true, mode: 0o700 });
+    const commissionCommands = new Map();
+    try {
+      const saved = JSON.parse(fs.readFileSync(COMMISSION_STATE_FILE, 'utf8'));
+      for (const command of saved.commands || []) {
+        if (command && command.command_id && command.device_id) commissionCommands.set(command.command_id, command);
+      }
+    } catch (err) {
+      if (err.code !== 'ENOENT') console.error('[commission-command] state load failed:', err.message);
+    }
+    function saveCommissionCommands() {
+      const tmp = `${COMMISSION_STATE_FILE}.tmp`;
+      fs.writeFileSync(tmp, JSON.stringify({ commands: Array.from(commissionCommands.values()) }, null, 2), { mode: 0o600 });
+      fs.renameSync(tmp, COMMISSION_STATE_FILE);
+    }
+    function commandView(command) {
+      const { device_id, command_id, operation, state, created_at, expires_at, updated_at, error_code } = command;
+      return { device_id, command_id, operation, state, created_at, expires_at, updated_at, ...(error_code ? { error_code } : {}) };
+    }
+
     // Persistent storage directory for AVC reports (survives server restarts)
     const AVC_DIR = path.join(__dirname, 'avc-reports');
     if (!fs.existsSync(AVC_DIR)) fs.mkdirSync(AVC_DIR, { recursive: true });
@@ -356,6 +381,27 @@ async function startMqttServer() {
           // tolerate empty/non-JSON payload - identity comes from the cert either way
         }
         handleCommissionRequest(client, topicDeviceId, payload);
+      }
+
+      // A command status is accepted only from an authenticated IDevID whose
+      // certificate-derived device ID matches the topic and command record.
+      const commandStatusMatch = /^commission\/([^/]+)\/command-status$/.exec(packet.topic);
+      if (commandStatusMatch && client) {
+        let payload;
+        try { payload = JSON.parse(packet.payload.toString()); } catch (_) { return; }
+        const clientInfo = connectedClients.get(client.id);
+        const certDeviceId = extractDeviceIdFromCommissionCN(clientInfo && clientInfo.cert && clientInfo.cert.cn);
+        const command = payload && commissionCommands.get(payload.command_id);
+        const allowed = new Set(['accepted', 'running', 'succeeded', 'failed', 'already_commissioned']);
+        if (!clientInfo || !clientInfo.tls || certDeviceId !== commandStatusMatch[1] || !command ||
+            command.device_id !== certDeviceId || !allowed.has(payload.state)) {
+          console.warn('[commission-command] rejected invalid command status');
+          return;
+        }
+        command.state = payload.state;
+        command.updated_at = new Date().toISOString();
+        command.error_code = payload.error_code || undefined;
+        saveCommissionCommands();
       }
     });
 
@@ -987,6 +1033,69 @@ async function startMqttServer() {
         publishCommissionResult(certDeviceId, { status: 'error', message: err.message });
       }
     }
+
+    // Additive operator API for server-initiated commissioning.  Do not reuse
+    // the IDevID-issuance key: creating a remote commissioning command is a
+    // distinct, auditable authority.  All three endpoints fail closed until
+    // the deployment provides COMMISSION_COMMAND_API_KEY.
+    function commissionApiAuthorized(req, res) {
+      const expected = process.env.COMMISSION_COMMAND_API_KEY;
+      const supplied = req.get('X-Commission-Command-Key') || '';
+      if (!expected) {
+        res.status(503).json({ status: 'error', message: 'commission command API not configured' });
+        return false;
+      }
+      const expectedBuf = Buffer.from(expected);
+      const suppliedBuf = Buffer.from(supplied);
+      if (expectedBuf.length !== suppliedBuf.length || !crypto.timingSafeEqual(expectedBuf, suppliedBuf)) {
+        res.status(401).json({ status: 'error', message: 'unauthorized' });
+        return false;
+      }
+      return true;
+    }
+
+    app.post('/api/v1/devices/:deviceId/commission-commands', (req, res) => {
+      if (!commissionApiAuthorized(req, res)) return;
+      const { deviceId } = req.params;
+      if (!DEVICE_ID_PATTERN.test(deviceId)) return res.status(400).json({ status: 'error', message: 'invalid device_id' });
+      const idempotencyKey = req.get('Idempotency-Key');
+      if (!idempotencyKey || idempotencyKey.length > 128) return res.status(400).json({ status: 'error', message: 'Idempotency-Key is required' });
+      const duplicate = Array.from(commissionCommands.values()).find((c) => c.device_id === deviceId && c.idempotency_key === idempotencyKey);
+      if (duplicate) return res.status(202).json(commandView(duplicate));
+      const now = new Date();
+      const command = {
+        device_id: deviceId, command_id: crypto.randomUUID(), idempotency_key: idempotencyKey,
+        operation: 'commission', state: 'queued', created_at: now.toISOString(), updated_at: now.toISOString(),
+        expires_at: new Date(now.getTime() + 5 * 60 * 1000).toISOString()
+      };
+      commissionCommands.set(command.command_id, command);
+      saveCommissionCommands();
+      const packet = { topic: `commission/${deviceId}/command`, qos: 1, retain: false,
+        payload: Buffer.from(JSON.stringify({ version: 1, command_id: command.command_id, operation: 'commission', expires_at: command.expires_at })) };
+      aedes.publish(packet, (err) => {
+        if (err) {
+          command.state = 'failed'; command.error_code = 'mqtt_publish_failed'; command.updated_at = new Date().toISOString(); saveCommissionCommands();
+          return res.status(502).json(commandView(command));
+        }
+        command.state = 'published'; command.updated_at = new Date().toISOString(); saveCommissionCommands();
+        return res.status(202).json(commandView(command));
+      });
+    });
+
+    app.get('/api/v1/devices/:deviceId/provisioning-status', (req, res) => {
+      if (!commissionApiAuthorized(req, res)) return;
+      const { deviceId } = req.params;
+      if (!DEVICE_ID_PATTERN.test(deviceId)) return res.status(400).json({ status: 'error', message: 'invalid device_id' });
+      const commands = Array.from(commissionCommands.values()).filter((c) => c.device_id === deviceId).sort((a, b) => b.created_at.localeCompare(a.created_at));
+      return res.json({ device_id: deviceId, provisioning_state: commands[0] ? commands[0].state : 'unknown', latest_command: commands[0] ? commandView(commands[0]) : null });
+    });
+
+    app.get('/api/v1/devices/:deviceId/commission-commands/:commandId', (req, res) => {
+      if (!commissionApiAuthorized(req, res)) return;
+      const command = commissionCommands.get(req.params.commandId);
+      if (!command || command.device_id !== req.params.deviceId) return res.status(404).json({ status: 'error', message: 'command not found' });
+      return res.json(commandView(command));
+    });
 
     // ────────────────────────────────────────────────────────────────────────
     // IDevID issuance (Endpoint B): a human OPERATOR calls this — plain HTTPS,
