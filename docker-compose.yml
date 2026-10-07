@@ -146,8 +146,7 @@ services:
       # than a dedicated variable. Fails closed (503) if unset.
       # /clamav detection uplink. Ingest (POST, X-Clamav-Report-Key) reuses
       # SSH_SIGN_API_KEY declared above (not the IDevID issuance key): no
-      # dedicated ingest variable.  Reading (GET) uses its own operator secret from
-      # Portainer's stack environment (never committed); unset -> 503.
+      # dedicated ingest variable; reading (GET, X-Clamav-Read-Key) uses the same
+      # key.  Unset -> 503.
       - CLAMAV_STATE_DIR=/app/clamav-reports
-      - CLAMAV_READ_API_KEY=${CLAMAV_READ_API_KEY:-}
     restart: always

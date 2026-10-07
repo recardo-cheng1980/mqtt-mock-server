@@ -4,7 +4,7 @@
 // Contract and rationale: docs/clamav-uplink-api-plan.md in uct-iq9075.
 //
 // - POST /clamav                        ingest (X-Clamav-Report-Key; value = SSH_SIGN_API_KEY)
-// - GET  /clamav/devices                summary (X-Clamav-Read-Key)
+// - GET  /clamav/devices                summary (X-Clamav-Read-Key; value = SSH_SIGN_API_KEY)
 // - GET  /clamav/devices/:id/events     list    (X-Clamav-Read-Key)
 //
 // Both credentials fail closed (503) when not configured and are never
@@ -235,11 +235,11 @@ function createClamavRouter(express, options = {}) {
       return next();
     };
   }
-  // Ingest reuses SSH_SIGN_API_KEY (no dedicated key, like /api/logs).  The
+  // Ingest and read both reuse SSH_SIGN_API_KEY (no dedicated key, like /api/logs).  The
   // manufacturing IDEVID_ISSUE_API_KEY is deliberately NOT accepted here.  The
   // header name stays X-Clamav-Report-Key so the DUT reporter is unchanged.
   const ingestGate = gate(['SSH_SIGN_API_KEY'], 'X-Clamav-Report-Key', 'ingest');
-  const readGate = gate(['CLAMAV_READ_API_KEY'], 'X-Clamav-Read-Key', 'read');
+  const readGate = gate(['SSH_SIGN_API_KEY'], 'X-Clamav-Read-Key', 'read');
 
   router.post('/', ingestGate, (req, res) => {
     const body = req.body;
