@@ -8,6 +8,7 @@ services:
       - /etc/app/certs:/app/certs:ro
       - /home/ext_recardo_cheng_gmail_com/avc-report:/app/avc-reports
       - /home/ext_recardo_cheng_gmail_com/commission-state:/app/commission-state
+      - /home/ext_recardo_cheng_gmail_com/clamav-reports:/app/clamav-reports
       - /etc/app/certs/.env:/app/.env:ro
     environment:
       # /api/ssh-sign — values come from Portainer's stack environment
@@ -143,4 +144,10 @@ services:
       # in code, this is defense in depth, not the only fix). Reuses the
       # same SSH_SIGN_API_KEY/X-SSH-Sign-Key already declared above rather
       # than a dedicated variable. Fails closed (503) if unset.
+      # /clamav detection uplink. Ingest (POST, X-Clamav-Report-Key) reuses
+      # SSH_SIGN_API_KEY declared above (not the IDevID issuance key): no
+      # dedicated ingest variable.  Reading (GET) uses its own operator secret from
+      # Portainer's stack environment (never committed); unset -> 503.
+      - CLAMAV_STATE_DIR=/app/clamav-reports
+      - CLAMAV_READ_API_KEY=${CLAMAV_READ_API_KEY:-}
     restart: always

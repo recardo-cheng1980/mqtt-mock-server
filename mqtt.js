@@ -5,6 +5,7 @@ const path = require('path');
 const crypto = require('crypto');
 const util = require('util');
 const { buildSshSignAudit, resolveSshSignRequest } = require('./ssh-sign-policy');
+const { createClamavRouter } = require('./clamav-api');
 const {
   buildPlaneSignAudit,
   getPlaneCaConfig,
@@ -414,6 +415,12 @@ async function startMqttServer() {
     //The http part
     const app = express();
     app.use(express.json({ limit: '10mb' }));  // AVC reports can be large
+
+    // Detection-uplink API. Mounted before the access logger below so a
+    // request body (file paths, hashes) is never written to the log.
+    app.use('/clamav', createClamavRouter(express, {
+      stateDir: process.env.CLAMAV_STATE_DIR || path.join(__dirname, 'clamav-reports')
+    }));
 
     // Full HTTP access logging — every request/response, headers and body
     // included. Header values are redacted via redactSensitive() (any
