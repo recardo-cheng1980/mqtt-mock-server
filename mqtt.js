@@ -4,6 +4,7 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const util = require('util');
+const { createLogFile, createLogsHandler } = require('./log-tail');
 const { buildSshSignAudit, resolveSshSignRequest } = require('./ssh-sign-policy');
 const { createClamavRouter } = require('./clamav-api');
 const {
@@ -23,15 +24,11 @@ const {
 // file's value. Silently a no-op if the file doesn't exist.
 const dotenvResult = require('dotenv').config({ path: '/app/.env', override: true });
 
-// File logging — mirrors every console.log/warn/error line into
-// /app/logs/mqtt-server.log (in addition to stdout, unchanged for
-// `docker logs`/Portainer's own log viewer). Requested explicitly without
-// an auth-gated read endpoint (see GET /api/logs below) — no filtering of
-// sensitive content is applied.
+// Each process writes to a new file; existing logs are retained. The named
+// volume mounted at /app/logs keeps them across container replacement.
 const LOG_DIR = path.join(__dirname, 'logs');
-const LOG_FILE = path.join(LOG_DIR, 'mqtt-server.log');
-if (!fs.existsSync(LOG_DIR)) fs.mkdirSync(LOG_DIR, { recursive: true });
-const logStream = fs.createWriteStream(LOG_FILE, { flags: 'a' });
+const { filename: LOG_FILE, fd: logFd } = createLogFile(LOG_DIR);
+const logStream = fs.createWriteStream(LOG_FILE, { fd: logFd, autoClose: true });
 
 function wrapConsole(method) {
   const original = console[method].bind(console);
@@ -1834,38 +1831,9 @@ async function startMqttServer() {
     // confirmed external scanning activity was already occurring). Values
     // logged going forward are redacted at the source (redactSensitive()),
     // so this is defense in depth, not the only fix.
-    // Reads /app/logs/mqtt-server.log, the file every console.log/warn/error
-    // call is mirrored into (see wrapConsole above).
+    // Reads the current process's log with bounded memory (see log-tail.js).
     // ────────────────────────────────────────────────────────────────────────
-    const LOG_TAIL_DEFAULT = 500;
-    const LOG_TAIL_MAX = 10000;
-
-    app.get('/api/logs', (req, res) => {
-      // Reuses SSH_SIGN_API_KEY/X-SSH-Sign-Key rather than a dedicated
-      // credential — same operator key already gates /api/ssh-sign and
-      // /api/ssh-host-issue above.
-      const apiKey = process.env.SSH_SIGN_API_KEY;
-      if (!apiKey) {
-        console.error('[logs] SSH_SIGN_API_KEY not configured — refusing all requests (fail closed)');
-        return res.status(503).json({ status: 'error', message: 'logs endpoint not configured' });
-      }
-      if (req.get('X-SSH-Sign-Key') !== apiKey) {
-        return res.status(401).json({ status: 'error', message: 'unauthorized' });
-      }
-
-      let tail = parseInt(req.query.tail, 10);
-      if (!Number.isFinite(tail) || tail <= 0) tail = LOG_TAIL_DEFAULT;
-      tail = Math.min(tail, LOG_TAIL_MAX);
-
-      fs.readFile(LOG_FILE, 'utf8', (err, data) => {
-        if (err) {
-          return res.status(500).json({ status: 'error', message: err.message });
-        }
-        const lines = data.split('\n').filter((l) => l.length > 0);
-        const selected = lines.slice(-tail);
-        res.json({ status: 'ok', total_lines: lines.length, returned: selected.length, logs: selected.join('\n') });
-      });
-    });
+    app.get('/api/logs', createLogsHandler(LOG_FILE, () => process.env.SSH_SIGN_API_KEY));
     // ────────────────────────────────────────────────────────────────────────
 
     // 3. 啟動 HTTP 伺服器 (強烈建議綁定 127.0.0.1 確保僅限本機存取)

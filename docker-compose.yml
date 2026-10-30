@@ -6,6 +6,7 @@ services:
       - "3000:3000"
     volumes:
       - /etc/app/certs:/app/certs:ro
+      - mqtt-server-logs:/app/logs
       - /home/ext_recardo_cheng_gmail_com/avc-report:/app/avc-reports
       - /home/ext_recardo_cheng_gmail_com/commission-state:/app/commission-state
       - /home/ext_recardo_cheng_gmail_com/clamav-reports:/app/clamav-reports
@@ -150,3 +151,6 @@ services:
       # key.  Unset -> 503.
       - CLAMAV_STATE_DIR=/app/clamav-reports
     restart: always
+
+volumes:
+  mqtt-server-logs:
