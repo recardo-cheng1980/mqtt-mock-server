@@ -2,8 +2,8 @@ services:
   mqtt-broker:
     build: .
     ports:
-      - "8443:8443"
-      - "3000:3000"
+      - "127.0.0.1:3000:3000"
+      - "127.0.0.1:8443:8443"
     volumes:
       - /etc/app/certs:/app/certs:ro
       - mqtt-server-logs:/app/logs
