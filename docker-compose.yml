@@ -7,9 +7,9 @@ services:
     volumes:
       - /etc/app/certs:/app/certs:ro
       - mqtt-server-logs:/app/logs
-      - /home/ext_recardo_cheng_gmail_com/avc-report:/app/avc-reports
-      - /home/ext_recardo_cheng_gmail_com/commission-state:/app/commission-state
-      - /home/ext_recardo_cheng_gmail_com/clamav-reports:/app/clamav-reports
+      - /home/ubuntu/wnc/avc-report:/app/avc-reports
+      - /home/ubuntu/wnc/commission-state:/app/commission-state
+      - /home/ubuntu/wnc/clamav-reports:/app/clamav-reports
       - /etc/app/certs/.env:/app/.env:ro
     environment:
       # /api/ssh-sign — values come from Portainer's stack environment
