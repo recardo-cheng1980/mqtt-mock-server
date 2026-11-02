@@ -101,6 +101,7 @@ services:
       # is what actually distinguishes "this cert came from the IDevID CA"
       # from "this cert's CN just happens to match the naming pattern".
       - IDEVID_CA_ISSUER_CN=${IDEVID_CA_ISSUER_CN:-}
+      - IDEVID_SUBJECT_SUFFIX=${IDEVID_SUBJECT_SUFFIX:-provision.csyang.org}
       # IDevID issuance (Endpoint B, POST /api/idevid-issue/:deviceId) —
       # operator-facing, plain HTTPS, separate dedicated Vault PKI mount from
       # the operational pki/sign/gateway mount (factory/enrollment CA kept

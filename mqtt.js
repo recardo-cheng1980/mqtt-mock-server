@@ -7,6 +7,7 @@ const util = require('util');
 const { createLogFile, createLogsHandler } = require('./log-tail');
 const { buildSshSignAudit, resolveSshSignRequest } = require('./ssh-sign-policy');
 const { createClamavRouter } = require('./clamav-api');
+const { parseTrustedRoots, isFactoryPeer, ReadinessChallenges, clientPublishAllowed, forwardAllowed } = require('./commission-readiness');
 const {
   buildPlaneSignAudit,
   getPlaneCaConfig,
@@ -162,6 +163,31 @@ async function startMqttServer() {
 
     // Track connected MQTT clients
     const connectedClients = new Map();
+    const idevidRoots = fs.existsSync('./certs/idevid-ca.crt')
+      ? parseTrustedRoots(fs.readFileSync('./certs/idevid-ca.crt')) : [];
+    const readiness = new ReadinessChallenges({
+      publish: (deviceId, requestId, callback) => aedes.publish({
+        topic: `commission/${deviceId}/readiness-request`, qos: 1, retain: false,
+        payload: Buffer.from(JSON.stringify({ version: 1, request_id: requestId }))
+      }, callback)
+    });
+    // Only server-side publications can initiate commissioning or request a
+    // readiness challenge. A client with a valid but unrelated certificate
+    // must not be able to impersonate the provisioning server.
+    aedes.authorizePublish = (client, packet, callback) => {
+      if (!clientPublishAllowed(client, packet, idevidRoots,
+        process.env.IDEVID_CA_ISSUER_CN, process.env.IDEVID_SUBJECT_SUFFIX)) {
+        return callback(new Error('unauthorized commissioning or system topic'));
+      }
+      return callback(null);
+    };
+    aedes.authorizeForward = (client, packet) => {
+      // A wildcard subscription must not reveal commissioning secrets or
+      // allow a different device to receive a server-only command.
+      if (!forwardAllowed(client, packet, idevidRoots,
+        process.env.IDEVID_CA_ISSUER_CN, process.env.IDEVID_SUBJECT_SUFFIX)) return null;
+      return packet;
+    };
 
     // Pending wait-for-result requests (currently /api/ssh-principals-refresh)
     // awaiting a correlated kms/<deviceId>/result
@@ -337,6 +363,19 @@ async function startMqttServer() {
         console.log(`收到來自 ${client.id} 的訊息，主題: ${packet.topic}`);
       }
 
+      const readinessMatch = /^commission\/([^/]+)\/readiness-response$/.exec(packet.topic);
+      if (readinessMatch && client) {
+        let payload;
+        try {
+          if (packet.retain || packet.payload.length > 1024) return;
+          payload = JSON.parse(packet.payload.toString());
+        } catch (_) { return; }
+        const validPeer = isFactoryPeer(client, readinessMatch[1], idevidRoots,
+          process.env.IDEVID_CA_ISSUER_CN, process.env.IDEVID_SUBJECT_SUFFIX);
+        readiness.receive(readinessMatch[1], payload, validPeer);
+        return;
+      }
+
       // Correlate DUT result messages back to a pending wait-for-result
       // request (/api/ssh-principals-refresh, ...).
       // kms-mqtt-trigger publishes to kms/<deviceId>/result with whatever
@@ -393,6 +432,8 @@ async function startMqttServer() {
         const allowed = new Set(['accepted', 'running', 'succeeded', 'failed', 'already_commissioned']);
         const expectedIssuer = process.env.IDEVID_CA_ISSUER_CN;
         if (!clientInfo || !clientInfo.tls || certDeviceId !== commandStatusMatch[1] || !command ||
+            !isFactoryPeer(client, commandStatusMatch[1], idevidRoots,
+              process.env.IDEVID_CA_ISSUER_CN, process.env.IDEVID_SUBJECT_SUFFIX) ||
             !expectedIssuer || clientInfo.cert.issuer !== expectedIssuer ||
             command.device_id !== certDeviceId || !allowed.has(payload.state)) {
           console.warn('[commission-command] rejected invalid command status');
@@ -707,7 +748,7 @@ async function startMqttServer() {
           // Matches the naming convention device-commission.py's IDevID CN
           // already uses ("<device_id>.provision.csyang.org") so both
           // identities are recognizable as belonging to the same device.
-          valid_principals: `${deviceId}.provision.csyang.org`,
+          valid_principals: `${deviceId}.${idevidSubjectSuffix()}`,
           ttl: process.env.VAULT_SSH_HOST_TTL || '8760h'
         });
 
@@ -903,14 +944,23 @@ async function startMqttServer() {
     // See docs/kms/provision-server-commission-endpoint-plan.md in uct-iq9075.
     // ────────────────────────────────────────────────────────────────────────
 
-    // The IDevID cert's CN/SAN is "<device_id>.provision.csyang.org" - a naming
-    // convention baked in at IDevID issuance time (Endpoint B), not a resolvable
-    // hostname. Parse the device_id back out for cross-checking.
-    const COMMISSION_CN_PATTERN = /^([a-zA-Z0-9-]+)\.provision\.csyang\.org$/;
+    // The certificate identity suffix is configured separately from the
+    // MQTT endpoint; it is an identity convention, not a network address.
+    function idevidSubjectSuffix() {
+      const suffix = process.env.IDEVID_SUBJECT_SUFFIX || '';
+      if (!/^[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*$/.test(suffix)) {
+        throw new Error('IDEVID_SUBJECT_SUFFIX not configured or invalid');
+      }
+      return suffix;
+    }
 
     function extractDeviceIdFromCommissionCN(cn) {
-      const m = COMMISSION_CN_PATTERN.exec(cn || '');
-      return m ? m[1] : null;
+      try {
+        const suffix = `.${idevidSubjectSuffix()}`;
+        if (typeof cn !== 'string' || !cn.endsWith(suffix)) return null;
+        const deviceId = cn.slice(0, -suffix.length);
+        return DEVICE_ID_PATTERN.test(deviceId) ? deviceId : null;
+      } catch (_) { return null; }
     }
 
     // Minimal raw-HTTP Vault client (mirrors vaultSshSign's shape below) — GET
@@ -1012,7 +1062,7 @@ async function startMqttServer() {
         console.error('[commission] IDEVID_CA_ISSUER_CN not configured — refusing all commission requests (fail closed)');
         return publishCommissionResult(topicDeviceId, { status: 'error', message: 'commission endpoint not configured' });
       }
-      if (clientInfo.cert.issuer !== expectedIssuer) {
+      if (!isFactoryPeer(client, certDeviceId, idevidRoots, expectedIssuer, process.env.IDEVID_SUBJECT_SUFFIX)) {
         console.warn(`[commission] rejected: client ${client.id} cert issued by "${clientInfo.cert.issuer}", expected IDevID CA "${expectedIssuer}"`);
         return publishCommissionResult(topicDeviceId, { status: 'error', message: 'certificate not issued by the IDevID CA' });
       }
@@ -1060,7 +1110,7 @@ async function startMqttServer() {
       return true;
     }
 
-    app.post('/api/v1/devices/:deviceId/commission-commands', (req, res) => {
+    app.post('/api/v1/devices/:deviceId/commission-commands', async (req, res) => {
       if (!commissionApiAuthorized(req, res)) return;
       const { deviceId } = req.params;
       if (!DEVICE_ID_PATTERN.test(deviceId)) return res.status(400).json({ status: 'error', message: 'invalid device_id' });
@@ -1068,6 +1118,11 @@ async function startMqttServer() {
       if (!idempotencyKey || idempotencyKey.length > 128) return res.status(400).json({ status: 'error', message: 'Idempotency-Key is required' });
       const duplicate = Array.from(commissionCommands.values()).find((c) => c.device_id === deviceId && c.idempotency_key === idempotencyKey);
       if (duplicate) return res.status(202).json(commandView(duplicate));
+      if (!await readiness.request(deviceId)) {
+        return res.status(409).json({ status: 'error', message: 'device factory provisioning not verified' });
+      }
+      const racedDuplicate = Array.from(commissionCommands.values()).find((c) => c.device_id === deviceId && c.idempotency_key === idempotencyKey);
+      if (racedDuplicate) return res.status(202).json(commandView(racedDuplicate));
       const now = new Date();
       const command = {
         device_id: deviceId, command_id: crypto.randomUUID(), idempotency_key: idempotencyKey,
@@ -1125,7 +1180,7 @@ async function startMqttServer() {
       }
       const mount = process.env.VAULT_IDEVID_PKI_MOUNT || 'pki_idevid';
       const role = process.env.VAULT_IDEVID_PKI_ROLE || 'idevid';
-      const commonName = `${deviceId}.provision.csyang.org`;
+      const commonName = `${deviceId}.${idevidSubjectSuffix()}`;
 
       const body = JSON.stringify({
         csr: csrPem,

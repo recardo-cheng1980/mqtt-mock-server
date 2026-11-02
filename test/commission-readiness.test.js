@@ -1,0 +1,60 @@
+'use strict';
+
+const test = require('node:test');
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+const { execFileSync } = require('node:child_process');
+const crypto = require('node:crypto');
+const { parseTrustedRoots, isFactoryPeer, ReadinessChallenges, clientPublishAllowed, forwardAllowed } = require('../commission-readiness');
+
+test('factory peer must use the expected device identity and a trusted factory signing key', t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'readiness-test-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const run = args => execFileSync('openssl', args, { cwd: dir, stdio: 'ignore' });
+  run(['req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-keyout', 'ca.key', '-out', 'ca.pem', '-days', '1', '-subj', '/CN=Factory CA']);
+  run(['req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-keyout', 'other.key', '-out', 'other.pem', '-days', '1', '-subj', '/CN=Factory CA']);
+  run(['req', '-newkey', 'rsa:2048', '-nodes', '-keyout', 'device.key', '-out', 'device.csr', '-subj', '/CN=kms-123.factory.example']);
+  run(['x509', '-req', '-in', 'device.csr', '-CA', 'ca.pem', '-CAkey', 'ca.key', '-CAcreateserial', '-out', 'device.pem', '-days', '1']);
+  const leaf = new crypto.X509Certificate(fs.readFileSync(path.join(dir, 'device.pem')));
+  const peer = { raw: leaf.raw, subject: { CN: 'kms-123.factory.example' }, issuer: { CN: 'Factory CA' } };
+  const client = { conn: { authorized: true, getPeerCertificate: () => peer } };
+  const roots = parseTrustedRoots(fs.readFileSync(path.join(dir, 'ca.pem')));
+  const other = parseTrustedRoots(fs.readFileSync(path.join(dir, 'other.pem')));
+  assert.equal(isFactoryPeer(client, 'kms-123', roots, 'Factory CA', 'factory.example'), true);
+  const allowed = packet => clientPublishAllowed(client, packet, roots, 'Factory CA', 'factory.example');
+  const forward = packet => forwardAllowed(client, packet, roots, 'Factory CA', 'factory.example');
+  assert.equal(allowed({topic:'commission/kms-123/command'}), false);
+  assert.equal(allowed({topic:'commission/kms-123/result'}), false);
+  assert.equal(allowed({topic:'commission/kms-123/readiness-request'}), false);
+  assert.equal(allowed({topic:'$SYS/bad'}), false);
+  assert.equal(allowed({topic:'commission/kms-123/readiness-response', retain:false}), true);
+  assert.equal(allowed({topic:'commission/kms-124/readiness-response', retain:false}), false);
+  assert.equal(allowed({topic:'commission/kms-123/readiness-response', retain:true}), false);
+  assert.equal(forward({topic:'commission/kms-123/result'}), true);
+  assert.equal(forward({topic:'commission/kms-124/result'}), false);
+  assert.equal(forward({topic:'application/example'}), true);
+  assert.equal(isFactoryPeer(client, 'kms-123', other, 'Factory CA', 'factory.example'), false);
+  assert.equal(isFactoryPeer(client, 'kms-124', roots, 'Factory CA', 'factory.example'), false);
+  assert.equal(isFactoryPeer(client, 'kms-123', roots, 'Factory CA', ''), false);
+  client.conn.authorized = false;
+  assert.equal(isFactoryPeer(client, 'kms-123', roots, 'Factory CA', 'factory.example'), false);
+});
+
+test('only a matching, authenticated, current readiness response can authorize a command', async () => {
+  let challenge;
+  const tracker = new ReadinessChallenges({ timeoutMs: 35, publish: (device, id, callback) => { challenge = { device, id }; callback(); } });
+  const answer = tracker.request('kms-123');
+  const payload = { version: 1, request_id: challenge.id, ready: true };
+  assert.equal(tracker.receive('kms-123', payload, false), false);
+  assert.equal(tracker.receive('kms-124', payload, true), false);
+  assert.equal(tracker.receive('kms-123', { ...payload, request_id: crypto.randomUUID() }, true), false);
+  assert.equal(tracker.receive('kms-123', payload, true), true);
+  assert.equal(await answer, true);
+  assert.equal(tracker.receive('kms-123', payload, true), false);
+  assert.equal(await tracker.request('kms-offline'), false);
+  const rejected = tracker.request('kms-123');
+  assert.equal(tracker.receive('kms-123', { version: 1, request_id: challenge.id, ready: false }, true), true);
+  assert.equal(await rejected, false);
+});
