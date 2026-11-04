@@ -111,4 +111,27 @@ net.Server.prototype.listen=function(...a){if(typeof a[0]==='number'){a[0]=a[0]=
   }
   assert.equal(await brokerAccepts('operational'), true, 'new operational client CA is trusted');
   assert.equal(await brokerAccepts('old'), false, 'old operational client CA is rejected');
+  // The live combined broker accepts both identities. A separate operational
+  // listener proves it can trust LDevID while rejecting a factory IDevID.
+  const operationalOnly=tls.createServer({
+    key:fs.readFileSync(path.join(dir,'certs/privkey.pem')),
+    cert:fs.readFileSync(path.join(dir,'certs/fullchain.pem')),
+    ca:fs.readFileSync(path.join(dir,'certs/operational-ca.crt')),
+    requestCert:true,rejectUnauthorized:true
+  }, peer=>peer.end('accepted'));
+  await new Promise(resolve=>operationalOnly.listen(0,'127.0.0.1',resolve));
+  t.after(()=>operationalOnly.close());
+  async function operationalListenerAccepts(key,cert) {
+    return await new Promise(resolve=>{
+      const peer=tls.connect({host:'127.0.0.1',port:operationalOnly.address().port,rejectUnauthorized:false,
+        key:fs.readFileSync(path.join(dir,key)),cert:fs.readFileSync(path.join(dir,cert))});
+      let done=false;
+      const finish=value=>{if(!done){done=true;clearTimeout(timer);peer.destroy();resolve(value);}};
+      const timer=setTimeout(()=>finish(false),5000);
+      peer.on('data',data=>finish(data.toString()==='accepted'));
+      peer.on('error',()=>finish(false)); peer.on('close',()=>finish(false));
+    });
+  }
+  assert.equal(await operationalListenerAccepts('operational-client.key','operational-client.crt'),true);
+  assert.equal(await operationalListenerAccepts('device.key','device.crt'),false);
 });
