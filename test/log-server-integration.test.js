@@ -12,7 +12,7 @@ test('real server starts a fresh log and exposes recent CA errors', { timeout: 3
   const src = path.resolve(__dirname, '..');
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mqtt-server-test-'));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
-  for (const name of ['mqtt.js', 'log-tail.js', 'ssh-sign-policy.js', 'ssh-plane-policy.js', 'clamav-api.js', 'commission-readiness.js', 'package.json']) {
+  for (const name of ['mqtt.js', 'mqtt-client-trust.js', 'operational-client-ca.pem', 'log-tail.js', 'ssh-sign-policy.js', 'ssh-plane-policy.js', 'clamav-api.js', 'commission-readiness.js', 'package.json']) {
     fs.copyFileSync(path.join(src, name), path.join(dir, name));
   }
   fs.symlinkSync(path.join(src, 'node_modules'), path.join(dir, 'node_modules'), 'dir');

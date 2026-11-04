@@ -7,6 +7,7 @@ const util = require('util');
 const { createLogFile, createLogsHandler } = require('./log-tail');
 const { buildSshSignAudit, resolveSshSignRequest } = require('./ssh-sign-policy');
 const { createClamavRouter } = require('./clamav-api');
+const { loadOperationalClientCa } = require('./mqtt-client-trust');
 const { parseTrustedRoots, isFactoryPeer, ReadinessChallenges, clientPublishAllowed, forwardAllowed } = require('./commission-readiness');
 const {
   buildPlaneSignAudit,
@@ -111,14 +112,11 @@ async function startMqttServer() {
       console.log(`[aedes connackSent] client=${client && client.id}:`, packet);
     });
 
-    // Trust anchors for client certs on this mTLS broker: the existing
-    // operational (LDevID) CA, plus the dedicated IDevID CA (see
-    // docs/kms/provision-server-commission-endpoint-plan.md in uct-iq9075) —
-    // kept as a separate file/CA so IDevID commissioning and operational MQTT
-    // traffic can both terminate here without merging trust domains.
+    // Trust the new operational client CA and the separate factory IDevID CA.
+    // Server TLS certificate configuration is independent of client trust.
     const brokerCaCerts = [
-      fs.readFileSync('./certs/intermediate-ca.crt'),
-      fs.readFileSync('./certs/root-ca.crt')
+      loadOperationalClientCa(process.env.MQTT_OPERATIONAL_CA_FILE ||
+        path.join(__dirname, 'operational-client-ca.pem'))
     ];
     if (fs.existsSync('./certs/idevid-ca.crt')) {
       brokerCaCerts.push(fs.readFileSync('./certs/idevid-ca.crt'));

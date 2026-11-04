@@ -14,7 +14,7 @@ test('real broker challenges the authenticated device before publishing a commis
   const src = path.resolve(__dirname, '..');
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'commission-integration-'));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
-  for (const name of ['mqtt.js', 'log-tail.js', 'ssh-sign-policy.js', 'ssh-plane-policy.js', 'clamav-api.js', 'commission-readiness.js', 'package.json']) {
+  for (const name of ['mqtt.js', 'mqtt-client-trust.js', 'operational-client-ca.pem', 'log-tail.js', 'ssh-sign-policy.js', 'ssh-plane-policy.js', 'clamav-api.js', 'commission-readiness.js', 'package.json']) {
     fs.copyFileSync(path.join(src, name), path.join(dir, name));
   }
   fs.symlinkSync(path.join(src, 'node_modules'), path.join(dir, 'node_modules'), 'dir');
@@ -30,6 +30,15 @@ test('real broker challenges the authenticated device before publishing a commis
     '-keyout','device.key','-out','device.csr']);
   run(['x509','-req','-in','device.csr','-CA','certs/idevid-ca.crt','-CAkey','ca.key',
     '-CAcreateserial','-out','device.crt','-days','1']);
+  for (const prefix of ['operational', 'old']) {
+    run(['req','-x509','-newkey','rsa:2048','-nodes','-days','1','-subj',`/CN=${prefix} CA`,
+      '-keyout',`${prefix}-ca.key`,'-out',`certs/${prefix}-ca.crt`, '-addext','basicConstraints=critical,CA:TRUE']);
+    run(['req','-newkey','rsa:2048','-nodes','-subj',`/CN=${prefix}-client`,
+      '-keyout',`${prefix}-client.key`,'-out',`${prefix}-client.csr`]);
+    run(['x509','-req','-in',`${prefix}-client.csr`,'-CA',`certs/${prefix}-ca.crt`,
+      '-CAkey',`${prefix}-ca.key`,'-CAcreateserial','-out',`${prefix}-client.crt`,'-days','1']);
+  }
+  fs.copyFileSync(path.join(dir,'certs/old-ca.crt'),path.join(dir,'certs/root-ca.crt'));
   const freePort = async () => {
     const s = net.createServer();
     await new Promise(resolve => s.listen(0,'127.0.0.1',resolve));
@@ -45,7 +54,8 @@ net.Server.prototype.listen=function(...a){if(typeof a[0]==='number'){a[0]=a[0]=
   const child = spawn(process.execPath, [path.join(dir,'mqtt.js')], {
     cwd:dir, stdio:'ignore', env:{PATH:process.env.PATH, HOME:dir, NODE_OPTIONS:`--require=${shim}`,
       TEST_HTTP_PORT:String(httpPort), TEST_MQTT_PORT:String(mqttPort), IDEVID_ISSUE_API_KEY:'test-operator',
-      IDEVID_CA_ISSUER_CN:'Factory CA', IDEVID_SUBJECT_SUFFIX:'factory.example'}
+      IDEVID_CA_ISSUER_CN:'Factory CA', IDEVID_SUBJECT_SUFFIX:'factory.example',
+      MQTT_OPERATIONAL_CA_FILE:path.join(dir,'certs','operational-ca.crt')}
   });
   t.after(() => { if (child.exitCode === null) child.kill('SIGTERM'); });
   const base=`http://127.0.0.1:${httpPort}`;
@@ -84,4 +94,21 @@ net.Server.prototype.listen=function(...a){if(typeof a[0]==='number'){a[0]=a[0]=
   assert.equal((await post('ready')).status,202);
   for (let n=0; n<20 && commands===0; n++) await new Promise(resolve=>setTimeout(resolve,25));
   assert.equal(commands,1);
+  async function brokerAccepts(prefix) {
+    const client=tls.connect({host:'127.0.0.1',port:mqttPort,rejectUnauthorized:false,
+      key:fs.readFileSync(path.join(dir,`${prefix}-client.key`)),
+      cert:fs.readFileSync(path.join(dir,`${prefix}-client.crt`))});
+    return await new Promise(resolve => {
+      let done=false;
+      const finish=value=>{ if (!done) { done=true; clearTimeout(timer); client.destroy(); resolve(value); } };
+      const timer=setTimeout(()=>finish(false),5000);
+      const packets=mqtt.parser(); client.on('data', chunk=>packets.parse(chunk));
+      packets.on('packet', packet=>{ if (packet.cmd==='connack') finish(packet.returnCode===0); });
+      client.on('secureConnect',()=>client.write(mqtt.generate({cmd:'connect',protocolId:'MQTT',
+        protocolVersion:4,clientId:`${prefix}-test`,clean:true,keepalive:30})));
+      client.on('error',()=>finish(false)); client.on('close',()=>finish(false));
+    });
+  }
+  assert.equal(await brokerAccepts('operational'), true, 'new operational client CA is trusted');
+  assert.equal(await brokerAccepts('old'), false, 'old operational client CA is rejected');
 });
